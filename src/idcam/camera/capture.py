@@ -51,11 +51,6 @@ class CaptureService:
             raise CaptureError("Capture file is empty")
         try:
             with Image.open(path) as img:
-                img.verify()
-        except Exception as exc:
-            raise CaptureError(f"JPEG validation failed: {exc}") from exc
-        try:
-            with Image.open(path) as img:
                 img.load()
                 fmt = (img.format or "").upper()
                 width, height = img.size

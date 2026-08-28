@@ -871,14 +871,22 @@ class ApplicationOrchestrator:
             except Exception:
                 scaler_crop = None
         require_roi = self._transaction.trigger == "auto" or self._accepted_geometry is not None
+        started = time.monotonic()
         try:
-            result = self.validator.validate(
+            result = await asyncio.to_thread(
+                self.validator.validate,
                 self._capture_path,
                 preview_roi=preview_roi,
                 preview_size=preview_size,
                 scaler_crop=scaler_crop,
                 preview_sharpness=self._transaction.sharpness_score,
                 require_document_roi=require_roi,
+            )
+            validation_ms = (time.monotonic() - started) * 1000.0
+            logger.info(
+                "event=image_validation_timing stage=validation_tick duration_ms=%.1f capture_id=%s",
+                validation_ms,
+                self._transaction.capture_id,
             )
             self._transaction.mark_validated(
                 size=result.file_bytes,
@@ -936,7 +944,17 @@ class ApplicationOrchestrator:
             created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
         try:
+            logger.info(
+                "event=image_validation_timing stage=upload_start duration_ms=0 capture_id=%s",
+                self._transaction.capture_id,
+            )
+            upload_started = time.monotonic()
             self._pending_response = await self.api.upload_document(request)
+            logger.info(
+                "event=image_validation_timing stage=upload duration_ms=%.1f capture_id=%s",
+                (time.monotonic() - upload_started) * 1000.0,
+                self._transaction.capture_id,
+            )
             self._transaction.mark_upload_completed(self._pending_response.http_status)
             self._upload_result = f"http_{self._pending_response.http_status}"
             logger.info(

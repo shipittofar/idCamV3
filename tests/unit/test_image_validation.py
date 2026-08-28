@@ -249,3 +249,75 @@ class TestStillDocumentValidation:
             require_document_roi=True,
         )
         assert result.sharpness >= result.sharpness_threshold
+
+
+class TestValidationPerformance:
+    def test_resize_input_is_document_crop_not_full_still(self, tmp_path, monkeypatch):
+        import cv2
+
+        seen: list[tuple[int, int]] = []
+        orig = cv2.resize
+
+        def spy(src, dsize, *args, **kwargs):
+            seen.append((int(src.shape[1]), int(src.shape[0])))
+            return orig(src, dsize, *args, **kwargs)
+
+        monkeypatch.setattr("idcam.vision.sharpness.cv2.resize", spy)
+        still_w, still_h = 400, 300
+        preview = (200, 150)
+        roi = (40, 30, 80, 60)
+        arr = np.full((still_h, still_w, 3), 80, dtype=np.uint8)
+        arr[60:180, 80:240] = _checkerboard(120, 160)
+        path = _save_rgb(tmp_path / "perf.jpg", arr)
+        validator = ImageValidator(
+            QualityConfig(
+                min_sharpness=80.0,
+                min_file_bytes=200,
+                min_width=64,
+                min_height=64,
+                require_expected_dimensions=False,
+            )
+        )
+        result = validator.validate(
+            path,
+            preview_roi=roi,
+            preview_size=preview,
+            scaler_crop=(0, 0, still_w, still_h),
+            preview_sharpness=10.7,
+            require_document_roi=True,
+        )
+        assert result.sharpness >= result.sharpness_threshold
+        assert seen
+        src_w, src_h = seen[0]
+        assert src_w * src_h < still_w * still_h
+        assert src_w <= 162
+        assert src_h <= 122
+        assert "resize" in result.timing_ms
+        assert "jpeg_decode" in result.timing_ms
+
+    def test_one_validation_call_records_single_decode(self, tmp_path, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+        path = _save_rgb(tmp_path / "once.jpg", _checkerboard(240, 320))
+        validator = ImageValidator(
+            QualityConfig(
+                min_sharpness=80.0,
+                min_file_bytes=200,
+                min_width=64,
+                min_height=64,
+                require_expected_dimensions=False,
+            )
+        )
+        validator.validate(
+            path,
+            preview_roi=(16, 16, 200, 160),
+            preview_size=(320, 240),
+            scaler_crop=(0, 0, 320, 240),
+            preview_sharpness=10.0,
+            require_document_roi=True,
+        )
+        completes = [r.message for r in caplog.records if "stage=validation_complete" in r.message]
+        assert len(completes) == 1
+        assert "decode_ops=1" in completes[0]
+        assert "resize_ops=1" in completes[0]

@@ -85,8 +85,8 @@ def reconstruct_preview_view(
 ) -> np.ndarray:
     """Map the still JPEG through ScalerCrop and resize to the preview pixel grid.
 
-    Preview AF Laplacian is computed on this same 1080p geometry. A 4:3 64MP
-    still must not be stretched to 16:9; only the live ScalerCrop window is used.
+    Production validation crops the document ROI first and does not call this
+    on the full 64MP frame. Kept for tests and diagnostics.
     """
     fw, fh = int(preview_size[0]), int(preview_size[1])
     if fw < 1 or fh < 1:
@@ -96,3 +96,18 @@ def reconstruct_preview_view(
     if window.size == 0:
         raise ValueError("invalid_scaler_crop")
     return cv2.resize(window, (fw, fh), interpolation=cv2.INTER_AREA)
+
+
+def resize_patch_to_preview(
+    patch_rgb: np.ndarray,
+    preview_wh: tuple[int, int],
+) -> np.ndarray:
+    """INTER_AREA downsample a still crop onto the preview-pixel ROI size."""
+    pw, ph = int(preview_wh[0]), int(preview_wh[1])
+    if pw < 1 or ph < 1:
+        raise ValueError("invalid_preview_size")
+    if patch_rgb.size == 0:
+        raise ValueError("invalid_roi")
+    if patch_rgb.shape[1] == pw and patch_rgb.shape[0] == ph:
+        return patch_rgb
+    return cv2.resize(patch_rgb, (pw, ph), interpolation=cv2.INTER_AREA)
