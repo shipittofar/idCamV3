@@ -37,7 +37,22 @@ class TempFileStore:
         return self.base_dir / name
 
     def create_partial_path(self, final_path: Path) -> Path:
-        return final_path.with_suffix(final_path.suffix + PARTIAL_SUFFIX)
+        """In-progress path for ``final_path``, keeping the image extension last.
+
+        The marker is infixed (``capture-x.partial.jpg``), never appended
+        (``capture-x.jpg.partial``). Encoders such as Picamera2's
+        ``capture_file()`` and ``PIL.Image.save()`` infer the container format
+        from the final extension, and an unknown trailing suffix makes them
+        raise instead of writing a JPEG.
+        """
+        suffix = final_path.suffix
+        if not suffix:
+            return final_path.with_name(final_path.name + PARTIAL_SUFFIX)
+        return final_path.with_name(f"{final_path.stem}{PARTIAL_SUFFIX}{suffix}")
+
+    @staticmethod
+    def is_partial_path(path: Path) -> bool:
+        return PARTIAL_SUFFIX in Path(path).name
 
     def finalize_capture(self, partial_path: Path, final_path: Path) -> Path:
         """Fsync partial file, validate exists, then atomically rename."""
@@ -81,7 +96,7 @@ class TempFileStore:
         for entry in self.base_dir.iterdir():
             if not entry.is_file():
                 continue
-            if not (entry.name.startswith(CAPTURE_PREFIX) or entry.name.endswith(PARTIAL_SUFFIX)):
+            if not (entry.name.startswith(CAPTURE_PREFIX) or self.is_partial_path(entry)):
                 continue
             try:
                 if now - entry.stat().st_mtime > max_age_sec:

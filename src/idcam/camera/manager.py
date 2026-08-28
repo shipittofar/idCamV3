@@ -35,6 +35,10 @@ _AF_STATE_FAILED = 3
 _AF_METERING_WINDOWS = 1
 _AF_RANGE_FULL = 2
 
+# Passed explicitly to every still encoder so the container is never inferred
+# from the output filename.
+STILL_ENCODER_FORMAT = "jpeg"
+
 
 def describe_preview_frame(frame: np.ndarray) -> dict[str, Any]:
     """Return shape/dtype/channel statistics for diagnostics. Does not mutate ``frame``."""
@@ -165,55 +169,80 @@ class CameraManager:
                     main={"size": (self.config.preview_width, self.config.preview_height), "format": "RGB888"},
                     buffer_count=4,
                 )
+                # One buffer is enough for one-shot stills. At 9152x6944 RGB888 a
+                # single buffer is ~182 MB of CMA, so a second one doubles the
+                # allocation for no benefit and can fail outright on a Pi 5.
                 self._still_config = self._picam2.create_still_configuration(
                     main={
                         "size": (self.config.capture_width, self.config.capture_height),
                         "format": "RGB888",
                     },
-                    buffer_count=2,
+                    buffer_count=1,
                 )
                 self._picam2.configure(self._preview_config)
                 self._picam2.start()
                 self._started = True
                 self._logged_preview_format = False
                 logger.info(
-                    "Camera initialized: preview=%dx%d capture=%dx%d",
+                    "event=camera_initialized requested_preview=%dx%d requested_capture=%dx%d "
+                    "configured=%s",
                     self.config.preview_width,
                     self.config.preview_height,
                     self.config.capture_width,
                     self.config.capture_height,
+                    self._stream_geometry_unlocked(),
                 )
                 try:
                     self._enable_preview_autofocus(wait=False)
                 except Exception as exc:
                     logger.warning("event=autofocus_preview_failed error=%s", exc)
             except Exception as exc:
+                # Picamera2() may already hold the device even when configure()
+                # or start() failed. Dropping the reference without close()
+                # leaves /dev/media* busy, so every later restart fails with
+                # "camera is already in use" and recovery can never succeed.
+                self._release_device_unlocked()
                 self._started = False
-                self._picam2 = None
                 raise CameraUnavailableError(f"Camera initialization failed: {exc}") from exc
+
+    def _release_device_unlocked(self) -> None:
+        """Stop and close the Picamera2 handle. Safe to call in any state."""
+        picam2, self._picam2 = self._picam2, None
+        if picam2 is None:
+            return
+        try:
+            picam2.stop()
+        except Exception as exc:
+            logger.debug("event=camera_stop_failed error=%s", exc)
+        try:
+            picam2.close()
+        except Exception as exc:
+            logger.error("event=camera_close_failed error=%s", exc)
 
     def shutdown(self) -> None:
         with self._lock:
-            if not self._started:
-                return
-            if self._picam2 is not None:
-                try:
-                    self._picam2.stop()
-                    self._picam2.close()
-                except Exception as exc:
-                    logger.error("Error closing camera: %s", exc)
-                finally:
-                    self._picam2 = None
+            # Release unconditionally: a failed initialize() can leave a live
+            # handle behind while _started is False.
+            had_device = self._picam2 is not None
+            was_started = self._started
+            self._release_device_unlocked()
             self._started = False
             self._logged_preview_format = False
             self._preview_af_mode = None
-            logger.info("Camera shut down")
+            logger.info(
+                "event=camera_shutdown was_started=%s device_released=%s", was_started, had_device
+            )
 
     def restart(self) -> None:
-        logger.info("Restarting camera")
-        self.shutdown()
-        time.sleep(1.0)
-        self.initialize()
+        """Atomic stop/start so no other caller observes a half-open camera."""
+        with self._lock:
+            logger.info("event=camera_restart_started")
+            self.shutdown()
+            # libcamera needs the media device to be fully released before it
+            # can be reacquired; this is a device settle, not a retry padding.
+            time.sleep(1.0)
+            self.initialize()
+            logger.info("event=camera_restart_completed")
 
     def capture_preview_array(self) -> np.ndarray:
         with self._lock:
@@ -230,11 +259,18 @@ class CameraManager:
             return frame
 
     def capture_still_to_file(self, path: Path) -> None:
+        """Capture one full-resolution JPEG to ``path``.
+
+        The encoder format is always passed explicitly, so ``path`` may carry
+        any extension (including in-progress names such as ``*.partial.jpg``)
+        without the container being guessed from the filename.
+        """
         with self._lock:
             if not self._started:
                 raise CameraError("Camera not started")
             if self._use_mock:
                 self._mock_still(path)
+                self._verify_still_written(path)
                 return
 
             assert self._picam2 is not None
@@ -254,11 +290,14 @@ class CameraManager:
                         "event=autofocus_result method=hold_lens_position lens_position=%s",
                         lens_position,
                     )
-                    try:
-                        self._picam2.capture_metadata()
-                    except Exception:
-                        logger.debug("event=still_pre_capture_metadata_failed", exc_info=True)
-                self._picam2.capture_file(str(path))
+                # Block until one frame has actually come through the new still
+                # configuration, so the JPEG is not encoded from the first
+                # frame of a mode switch that has not settled yet.
+                try:
+                    self._picam2.capture_metadata()
+                except Exception:
+                    logger.debug("event=still_pre_capture_metadata_failed", exc_info=True)
+                self._picam2.capture_file(str(path), format=STILL_ENCODER_FORMAT)
             finally:
                 try:
                     self._picam2.stop()
@@ -271,6 +310,17 @@ class CameraManager:
                 except Exception as exc:
                     logger.error("Failed to restore preview mode: %s", exc)
                     raise CameraError(f"Failed to restore preview after capture: {exc}") from exc
+            self._verify_still_written(path)
+
+    @staticmethod
+    def _verify_still_written(path: Path) -> None:
+        """Post-condition: the encoder produced a real, non-empty file."""
+        if not path.exists():
+            raise CameraError(f"Capture reported success but no file was written: {path}")
+        size = path.stat().st_size
+        if size == 0:
+            raise CameraError(f"Capture wrote an empty file: {path}")
+        logger.info("event=still_written path=%s bytes=%d", path, size)
 
     def get_controls(self) -> dict[str, Any]:
         """Return advertised control *capabilities* (typically min/max/default), not live values."""
@@ -302,6 +352,59 @@ class CameraManager:
             logger.warning("None of controls %s are advertised", list(control_dict.keys()))
             return
         self._picam2.set_controls(filtered)
+
+    def stream_geometry(self) -> dict[str, Any]:
+        """Actually configured preview/still geometry.
+
+        libcamera aligns requested sizes to what the sensor and ISP can do, so
+        the configured stream can differ from the requested one. Preview->sensor
+        ROI mapping and capture dimension checks must use these numbers, not the
+        values from config.
+        """
+        with self._lock:
+            return self._stream_geometry_unlocked()
+
+    def _stream_geometry_unlocked(self) -> dict[str, Any]:
+        requested = {
+            "preview": (int(self.config.preview_width), int(self.config.preview_height)),
+            "still": (int(self.config.capture_width), int(self.config.capture_height)),
+        }
+        if self._use_mock or self._picam2 is None:
+            return {
+                "requested": requested,
+                "source": "mock" if self._use_mock else "not_initialized",
+                "preview": requested["preview"],
+                "still": requested["still"],
+            }
+
+        def main_stream(cfg: Any) -> dict[str, Any]:
+            try:
+                main = cfg["main"] if cfg is not None else None
+            except (TypeError, KeyError):
+                main = None
+            if not isinstance(main, dict):
+                return {}
+            size = main.get("size")
+            return {
+                "size": tuple(int(v) for v in size) if size else None,
+                "format": main.get("format"),
+                "stride": main.get("stride"),
+            }
+
+        preview = main_stream(self._preview_config)
+        still = main_stream(self._still_config)
+        return {
+            "requested": requested,
+            # "configured" means the values libcamera wrote back during
+            # configure(); "requested" means we could not read them and are
+            # echoing the request, which must not be mistaken for confirmation.
+            "source": "configured" if preview.get("size") and still.get("size") else "requested",
+            "preview": preview.get("size") or requested["preview"],
+            "preview_format": preview.get("format"),
+            "preview_stride": preview.get("stride"),
+            "still": still.get("size") or requested["still"],
+            "still_format": still.get("format"),
+        }
 
     def current_scaler_crop(self) -> tuple[int, int, int, int]:
         """Live stream crop on the sensor, else ScalerCropMaximum, else preview size."""
