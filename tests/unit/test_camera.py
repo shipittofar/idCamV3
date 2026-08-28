@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -367,4 +368,61 @@ class TestProductionCapturePath:
         with pytest.raises(CaptureError):
             await service.capture(mgr, output)
         assert not output.exists()
+        mgr.shutdown()
+
+    async def test_truncated_jpeg_is_not_success(self, fake_camera, tmp_path):
+        from idcam.camera.capture import CaptureService
+        from idcam.exceptions import CaptureError
+        from idcam.storage.temp_files import TempFileStore
+
+        mgr = _manager()
+        mgr.initialize()
+        store = TempFileStore(tmp_path)
+        service = CaptureService(mgr.config, store)
+        output = store.create_temp_path()
+
+        def truncated(path, format=None, **_):
+            fake_camera.instances[0].capture_file_calls.append((str(path), format))
+            Path(path).write_bytes(b"\xff\xd8\xff" + b"\x00" * 32)
+
+        fake_camera.instances[0].capture_file = truncated
+        with pytest.raises(CaptureError, match="JPEG|truncated|validation"):
+            await service.capture(mgr, output)
+        assert not output.exists()
+        mgr.shutdown()
+
+    async def test_wrong_still_dimensions_are_rejected(self, fake_camera, tmp_path):
+        from idcam.camera.capture import CaptureService
+        from idcam.exceptions import CaptureError
+        from idcam.storage.temp_files import TempFileStore
+
+        mgr = _manager()
+        mgr.initialize()
+        store = TempFileStore(tmp_path)
+        service = CaptureService(mgr.config, store)
+        output = store.create_temp_path()
+
+        def tiny_jpeg(path, format=None, **_):
+            fake_camera.instances[0].capture_file_calls.append((str(path), format))
+            Image.new("RGB", (32, 24), color=(80, 80, 80)).save(path, format="JPEG")
+
+        fake_camera.instances[0].capture_file = tiny_jpeg
+        with pytest.raises(CaptureError, match="Invalid dimensions"):
+            await service.capture(mgr, output)
+        assert not output.exists()
+        mgr.shutdown()
+
+    async def test_finalize_write_failure_is_capture_error(self, fake_camera, tmp_path):
+        from idcam.camera.capture import CaptureService
+        from idcam.exceptions import CaptureError
+        from idcam.storage.temp_files import TempFileStore
+
+        mgr = _manager()
+        mgr.initialize()
+        store = TempFileStore(tmp_path)
+        service = CaptureService(mgr.config, store)
+        output = store.create_temp_path()
+        with patch.object(store, "finalize_capture", side_effect=OSError("disk full")):
+            with pytest.raises(CaptureError, match="write failed"):
+                await service.capture(mgr, output)
         mgr.shutdown()

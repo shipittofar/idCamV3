@@ -158,6 +158,9 @@ class TestAutoCapturePath:
         orch = _orch(app_config)
         orch.sm.state = AppState.CAPTURING
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._transaction.mark_focus_completed(90.0, 10.0)
+        page = _document_frame()
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
         orch._check_motion_abort = AsyncMock(return_value=True)
 
         async def fake_capture(_camera, path):
@@ -567,6 +570,7 @@ class TestPhase2DFocusCaptureHandoff:
         orch = _orch(app_config)
         orch.sm.state = AppState.CAPTURING
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._transaction.mark_focus_completed(90.0, 10.0)
         page = _document_frame()
         orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
         orch._safe_preview = AsyncMock(return_value=page)
@@ -582,6 +586,7 @@ class TestPhase2DFocusCaptureHandoff:
         orch.sm.state = AppState.CAPTURING
         orch._resume_state = AppState.IDLE
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._transaction.mark_focus_completed(90.0, 10.0)
         still = _document_frame(box=(80, 60, 480, 360))
         moved = _document_frame(box=(180, 120, 400, 300))
         orch._snapshot_accepted_geometry(orch.detector.detect_geometry(still))
@@ -599,6 +604,7 @@ class TestPhase2DFocusCaptureHandoff:
         orch = _orch(app_config)
         orch.sm.state = AppState.CAPTURING
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._transaction.mark_focus_completed(90.0, 10.0)
         page = _document_frame()
         orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
         orch._safe_preview = AsyncMock(return_value=page)
@@ -668,6 +674,47 @@ class TestPhase2DFocusCaptureHandoff:
         await orch._focusing_tick()
         assert orch.sm.state != AppState.FOCUS_VERIFICATION
         assert orch._awaiting_clear_scene is True
+
+
+class TestPhase4CaptureGate:
+    @pytest.mark.asyncio
+    async def test_capture_blocked_without_verified_focus(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.CAPTURING
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        page = _document_frame()
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
+        orch.capture_service.capture = AsyncMock()
+        await orch._capturing_tick()
+        orch.capture_service.capture.assert_not_called()
+        assert orch.sm.state != AppState.IMAGE_VALIDATION
+
+    @pytest.mark.asyncio
+    async def test_auto_capture_blocked_without_accepted_geometry(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.CAPTURING
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1", trigger="auto")
+        orch._transaction.mark_focus_completed(90.0, 10.0)
+        orch.capture_service.capture = AsyncMock()
+        await orch._capturing_tick()
+        orch.capture_service.capture.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_shot_capturing_does_not_double_capture(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.CAPTURING
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._transaction.mark_focus_completed(90.0, 10.0)
+        page = _document_frame()
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
+        orch.capture_service.capture = AsyncMock()
+        orch._state_action_claimed = AppState.CAPTURING
+        await orch._capturing_tick()
+        orch.capture_service.capture.assert_not_called()
 
 
 

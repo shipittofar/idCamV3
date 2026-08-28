@@ -116,6 +116,7 @@ class ApplicationOrchestrator:
         self._capture_started = False
         self._upload_started = False
         self._upload_result = ""
+        self._last_capture_duration_ms = 0.0
         self._manual_capture_requested = False
         self._logged_preview_rgb = False
         self._preview_tick_times: deque[float] = deque(maxlen=25)
@@ -778,6 +779,20 @@ class ApplicationOrchestrator:
         if not self._claim_state_action():
             return
         assert self._transaction is not None
+        if self._transaction.focus_completed_at is None:
+            logger.error(
+                "event=capture_result success=0 reason=focus_not_verified capture_id=%s",
+                self._transaction.capture_id,
+            )
+            await self._fail_transaction_and_wait("focus_failed", "capture blocked: focus not verified")
+            return
+        if self._transaction.trigger == "auto" and self._accepted_geometry is None:
+            logger.error(
+                "event=capture_result success=0 reason=no_accepted_geometry capture_id=%s",
+                self._transaction.capture_id,
+            )
+            await self._fail_transaction_and_wait("focus_failed", "capture blocked: no accepted document geometry")
+            return
         if not await self._check_motion_abort():
             return
         if not self.disk.can_capture(self.config.storage.capture_reserve_mb):
@@ -794,20 +809,25 @@ class ApplicationOrchestrator:
             None if self._accepted_geometry is None else self._accepted_geometry.bbox,
         )
         logger.info("event=pipeline_stage stage=capturing path=%s", output_path)
+        started = time.monotonic()
         try:
             self._capture_path = await self.capture_service.capture(self.camera, output_path)
+            self._last_capture_duration_ms = (time.monotonic() - started) * 1000.0
             self.sm.touch_progress()
             logger.info(
-                "event=capture_result capture_id=%s success=1 path=%s",
+                "event=capture_encoded capture_id=%s path=%s duration_ms=%.0f",
                 self._transaction.capture_id,
                 self._capture_path,
+                self._last_capture_duration_ms,
             )
             self._transition(AppState.IMAGE_VALIDATION)
         except CaptureError as exc:
+            self._last_capture_duration_ms = (time.monotonic() - started) * 1000.0
             logger.error(
-                "event=capture_result capture_id=%s success=0 error=%s",
+                "event=capture_result capture_id=%s success=0 reason=%s duration_ms=%.0f",
                 self._transaction.capture_id,
                 exc,
+                self._last_capture_duration_ms,
             )
             self.temp_store.cleanup(output_path)
             await self._enter_recovery(str(exc))
@@ -829,6 +849,17 @@ class ApplicationOrchestrator:
                 sharpness=result.sharpness,
             )
             logger.info(
+                "event=capture_result capture_id=%s success=1 path=%s width=%d height=%d "
+                "size_bytes=%d duration_ms=%.0f validation=ok sharpness=%.1f",
+                self._transaction.capture_id,
+                self._capture_path,
+                result.width,
+                result.height,
+                result.file_bytes,
+                self._last_capture_duration_ms,
+                result.sharpness,
+            )
+            logger.info(
                 "event=image_validated sha256=%s sharpness=%.1f",
                 result.sha256[:16],
                 result.sharpness,
@@ -836,6 +867,11 @@ class ApplicationOrchestrator:
             self.sm.touch_progress()
             self._transition(AppState.UPLOADING)
         except ImageValidationError as exc:
+            logger.error(
+                "event=capture_result capture_id=%s success=0 reason=validation_failure detail=%s",
+                self._transaction.capture_id,
+                exc,
+            )
             logger.error("event=image_validation_failed %s", exc)
             self.temp_store.cleanup(self._capture_path)
             await self._fail_transaction_and_wait("image_invalid", str(exc))
