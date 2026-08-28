@@ -6,6 +6,7 @@ import asyncio
 import signal
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from idcam import __version__
@@ -13,7 +14,7 @@ from idcam.app.state_machine import AppState, StateMachine
 from idcam.app.transaction import ActiveCaptureTransaction, TransactionPhase
 from idcam.camera.autofocus import AutofocusController
 from idcam.camera.capture import CaptureService
-from idcam.camera.manager import CameraManager
+from idcam.camera.manager import CameraManager, describe_preview_frame
 from idcam.camera.quality import ImageValidator
 from idcam.config.schema import AppConfig
 from idcam.exceptions import (
@@ -109,6 +110,11 @@ class ApplicationOrchestrator:
         self._upload_started = False
         self._upload_result = ""
         self._manual_capture_requested = False
+        self._logged_preview_rgb = False
+        self._preview_tick_times: deque[float] = deque(maxlen=25)
+        self._preview_tick_count = 0
+        self._last_tick_ms = 0.0
+        self._last_detect_hz = 0.0
         if config.debug.enabled:
             self._debug_viewer = LiveDebugViewer(config.debug)
             self._debug_viewer.set_capture_handler(self.request_manual_capture)
@@ -223,8 +229,33 @@ class ApplicationOrchestrator:
                 await asyncio.sleep(frame_interval)
                 continue
 
+            tick_started = time.monotonic()
             await self._dispatch_state_tick()
+            self._note_preview_tick(time.monotonic() - tick_started)
             await asyncio.sleep(frame_interval)
+
+    def _note_preview_tick(self, elapsed_sec: float) -> None:
+        """Record application sample/detect rate. Not camera FPS and not MJPEG FPS."""
+        self._last_tick_ms = elapsed_sec * 1000.0
+        now = time.monotonic()
+        self._preview_tick_times.append(now)
+        if len(self._preview_tick_times) >= 2:
+            span = self._preview_tick_times[-1] - self._preview_tick_times[0]
+            if span > 0:
+                self._last_detect_hz = (len(self._preview_tick_times) - 1) / span
+        self._preview_tick_count += 1
+        if self._preview_tick_count == 1 or self._preview_tick_count % 25 == 0:
+            doc = self.detector.debug_info()
+            logger.info(
+                "event=preview_tick tick_ms=%.1f detect_hz=%.2f preview_wh=%dx%d document_roi=%s "
+                "configured_preview_fps=%.1f note=detect_hz_is_app_sample_rate_not_camera_fps",
+                self._last_tick_ms,
+                self._last_detect_hz,
+                doc.frame_width,
+                doc.frame_height,
+                "{},{},{},{}".format(*doc.document_roi) if doc.document_roi != (0, 0, 0, 0) else "",
+                self.config.camera.preview_fps,
+            )
 
     async def _handle_state_timeout(self) -> bool:
         if not self.sm.is_timed_out():
@@ -299,12 +330,23 @@ class ApplicationOrchestrator:
 
     async def _safe_preview(self):
         try:
-            return await asyncio.to_thread(self.camera.capture_preview_array)
+            frame = await asyncio.to_thread(self.camera.capture_preview_array)
         except CameraError as exc:
             logger.error("event=camera_preview_failed %s", exc)
             self._publish_debug(camera_error=str(exc))
             await self._enter_recovery(str(exc))
             return None
+        if not self._logged_preview_rgb:
+            info = describe_preview_frame(frame)
+            logger.info(
+                "event=preview_rgb_contract shape=%s dtype=%s channel_means=%s assumed_order=RGB "
+                "note=one_shot_detector_input_not_a_hardware_color_proof",
+                info.get("shape"),
+                info.get("dtype"),
+                info.get("channel_means"),
+            )
+            self._logged_preview_rgb = True
+        return frame
 
     async def _check_motion_abort(self) -> bool:
         """Return False if document moved and transaction was failed."""
@@ -1045,6 +1087,8 @@ class ApplicationOrchestrator:
             capture_started=self._capture_started,
             upload_started=self._upload_started,
             upload_result=self._upload_result,
+            detect_hz=self._last_detect_hz,
+            tick_ms=self._last_tick_ms,
         )
 
     async def _shutdown(self) -> None:

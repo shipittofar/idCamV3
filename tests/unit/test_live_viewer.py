@@ -20,9 +20,11 @@ from idcam.preview.live_viewer import (
     DebugSnapshot,
     LiveDebugViewer,
     LiveFrameBuffer,
+    compose_debug_frame,
     draw_overlay,
     encode_jpeg,
     make_placeholder,
+    resize_debug_frame,
 )
 from idcam.vision.document_detector import DocumentDetector
 from idcam.vision.stability_detector import StabilityDetector
@@ -185,6 +187,76 @@ class TestOverlayDoesNotMutate:
         assert not np.array_equal(stored, frame)
 
 
+class TestOverlayResizeUsesPreviewCoordinates:
+    """Regression: document_roi is preview pixels; MJPEG may shrink 1920→1280."""
+
+    _SRC_W, _SRC_H = 1920, 1080
+    _MAX_W = 1280
+    _ROI = (400, 200, 1120, 680)
+
+    def _snapshot(self) -> DebugSnapshot:
+        x, y, w, h = self._ROI
+        return DebugSnapshot(
+            state="IDLE",
+            document_detected=True,
+            camera_healthy=True,
+            roi_center_fraction=0.7,
+            document_roi=f"{x},{y},{w},{h}",
+            frame_width=self._SRC_W,
+            frame_height=self._SRC_H,
+        )
+
+    def _window_mean(self, image: np.ndarray, x: int, y: int, rad: int = 2) -> np.ndarray:
+        h, w = image.shape[:2]
+        x0, x1 = max(0, x - rad), min(w, x + rad + 1)
+        y0, y1 = max(0, y - rad), min(h, y + rad + 1)
+        return image[y0:y1, x0:x1].mean(axis=(0, 1))
+
+    def test_compose_scales_document_roi_and_does_not_use_raw_1920_coords(self):
+        frame = np.full((self._SRC_H, self._SRC_W, 3), 18, dtype=np.uint8)
+        original = frame.copy()
+        snap = self._snapshot()
+        scale = self._MAX_W / float(self._SRC_W)
+        expected = tuple(int(round(v * scale)) for v in self._ROI)
+        # Top-left of the ROI sits under the HUD panel. Use the bottom edge instead.
+        src_bl = (self._ROI[0], self._ROI[1] + self._ROI[3])
+        scaled_bl = (int(round(src_bl[0] * scale)), int(round(src_bl[1] * scale)))
+        # Unscaled 1920-space point that remains inside a 1280x720 canvas.
+        raw_on_720 = (self._ROI[0], min(self._ROI[1] + self._ROI[3] - 40, 700))
+
+        composed = compose_debug_frame(frame, snap, fps=5.0, max_width=self._MAX_W, overlay=True)
+
+        assert np.array_equal(frame, original)
+        assert composed is not frame
+        assert composed.shape[1] == self._MAX_W
+        assert composed.shape[0] == int(round(self._SRC_H * scale))
+        assert expected == (267, 133, 747, 453)
+        assert scaled_bl == (267, 587)
+
+        at_scaled = self._window_mean(composed, scaled_bl[0], scaled_bl[1])
+        at_raw = self._window_mean(composed, raw_on_720[0], raw_on_720[1])
+        # RGB document stroke is (80, 180, 255); INTER_AREA mixes a 2px line.
+        assert at_scaled[2] > 70
+        assert at_scaled[2] > at_raw[2] + 30
+        assert at_raw[2] < 50
+
+    def test_resize_then_draw_is_the_bug_this_fixes(self):
+        """Shrinking first places the 1920 ROI at raw (400,y) on the 1280 image."""
+        frame = np.full((self._SRC_H, self._SRC_W, 3), 18, dtype=np.uint8)
+        snap = self._snapshot()
+        scale = self._MAX_W / float(self._SRC_W)
+        scaled_bl = (
+            int(round(self._ROI[0] * scale)),
+            int(round((self._ROI[1] + self._ROI[3]) * scale)),
+        )
+        raw_on_720 = (self._ROI[0], 700)
+        broken = draw_overlay(resize_debug_frame(frame, self._MAX_W), snap, 5.0)
+        at_raw = self._window_mean(broken, raw_on_720[0], raw_on_720[1])
+        at_scaled = self._window_mean(broken, scaled_bl[0], scaled_bl[1])
+        assert at_raw[2] > 90
+        assert at_raw[2] > at_scaled[2] + 40
+
+
 class TestDebugHttp:
     def test_status_json_and_no_secrets(self, debug_viewer):
         debug_viewer.publish(
@@ -218,6 +290,9 @@ class TestDebugHttp:
         assert "reject_reason" in payload
         assert payload["frame"]["channel_order"] == "RGB"
         assert payload["frame"]["shape"] == [80, 120, 3]
+        assert "mjpeg_fps" in payload
+        assert "detect_hz" in payload
+        assert "tick_ms" in payload
 
     def test_html_page(self, debug_viewer):
         url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/live"

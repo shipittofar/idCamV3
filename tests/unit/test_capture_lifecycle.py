@@ -304,3 +304,14 @@ class TestManualCapturePolicy:
         assert orch._awaiting_clear_scene is True
         available, _phase, _msg = orch._manual_status()
         assert available is True
+
+
+class TestPreviewTickObservability:
+    def test_note_preview_tick_sets_detect_hz_not_camera_fps(self, app_config):
+        orch = ApplicationOrchestrator(app_config, use_mock_camera=True)
+        orch._note_preview_tick(0.04)
+        orch._note_preview_tick(0.04)
+        assert orch._last_tick_ms == pytest.approx(40.0, abs=0.1)
+        assert orch._last_detect_hz > 0
+        assert orch._preview_tick_count == 2
+

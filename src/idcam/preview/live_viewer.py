@@ -84,6 +84,8 @@ class DebugSnapshot:
     capture_started: bool = False
     upload_started: bool = False
     upload_result: str = ""
+    detect_hz: float = 0.0
+    tick_ms: float = 0.0
 
 
 class LiveFrameBuffer:
@@ -239,7 +241,8 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
         f"SENSOR ROI: {snapshot.sensor_focus_roi or '-'}",
         f"REASON: {snapshot.state_reason or '-'}",
         f"MANUAL: req={snapshot.manual_capture_requested} cap={snapshot.capture_started} up={snapshot.upload_started} {snapshot.upload_result or '-'}",
-        f"FPS: {fps:.1f}",
+        f"MJPEG FPS: {fps:.1f} (encoder, not camera)",
+        f"DETECT Hz: {snapshot.detect_hz:.1f}  TICK: {snapshot.tick_ms:.0f}ms",
         f"CAMERA: {camera}",
     ]
     if snapshot.camera_error and not snapshot.camera_healthy:
@@ -247,6 +250,26 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
         lines.append(f"DETAIL: {err}")
     _draw_panel(debug_frame, lines, banner=banner)
     return debug_frame
+
+
+def compose_debug_frame(
+    frame: np.ndarray,
+    snapshot: DebugSnapshot,
+    fps: float,
+    max_width: int,
+    *,
+    overlay: bool = True,
+) -> np.ndarray:
+    """Draw overlay in ``frame`` preview coordinates, then shrink for MJPEG.
+
+    Document/focus ROIs are preview pixels of ``frame``. Draw first, then resize,
+    so a 1920-space box is not painted onto a 1280-wide image.
+    """
+    if overlay:
+        image = draw_overlay(frame, snapshot, fps)
+    else:
+        image = frame.copy()
+    return resize_debug_frame(image, max_width)
 
 
 def _parse_roi(value: str) -> tuple[int, int, int, int] | None:
@@ -341,7 +364,9 @@ _HTML_PAGE = """<!DOCTYPE html>
         <dt>Sharpness ratio</dt><dd id="ratio">—</dd>
         <dt>State reason</dt><dd id="reason">—</dd>
         <dt>Capture / upload</dt><dd id="pipeline">—</dd>
-        <dt>FPS</dt><dd id="fps">—</dd>
+        <dt>MJPEG FPS (encoder)</dt><dd id="fps">—</dd>
+        <dt>Detect Hz</dt><dd id="detecthz">—</dd>
+        <dt>Tick ms</dt><dd id="tickms">—</dd>
         <dt>Timestamp</dt><dd id="timestamp">—</dd>
       </dl>
       <button id="capture" type="button">Capture &amp; Send</button>
@@ -397,7 +422,9 @@ _HTML_PAGE = """<!DOCTYPE html>
         el("ratio").textContent = Number(d.improvement_ratio || 0).toFixed(2);
         el("reason").textContent = d.state_reason || "—";
         el("pipeline").textContent = "manual=" + (d.manual_capture_requested ? "yes" : "no") + " capture=" + (d.capture_started ? "yes" : "no") + " upload=" + (d.upload_started ? "yes" : "no") + " " + (d.upload_result || "—");
-        el("fps").textContent = Number(d.fps).toFixed(1);
+        el("fps").textContent = Number(d.mjpeg_fps != null ? d.mjpeg_fps : d.fps).toFixed(1);
+        el("detecthz").textContent = Number(d.detect_hz || 0).toFixed(1);
+        el("tickms").textContent = Number(d.tick_ms || 0).toFixed(0);
         const ts = d.timestamp ? new Date(d.timestamp * 1000).toISOString() : "—";
         el("timestamp").textContent = ts;
         const btn = el("capture");
@@ -731,6 +758,8 @@ class LiveDebugViewer:
         capture_started: bool = False,
         upload_started: bool = False,
         upload_result: str = "",
+        detect_hz: float = 0.0,
+        tick_ms: float = 0.0,
     ) -> None:
         """Store the latest preview copy and metadata. Never blocks on HTTP clients."""
         with self._meta_lock:
@@ -793,6 +822,8 @@ class LiveDebugViewer:
                 capture_started=capture_started,
                 upload_started=upload_started,
                 upload_result=upload_result,
+                detect_hz=detect_hz,
+                tick_ms=tick_ms,
             )
 
     def snapshot_meta(self) -> DebugSnapshot:
@@ -823,6 +854,9 @@ class LiveDebugViewer:
             "camera_healthy": snap.camera_healthy,
             "autofocus_available": snap.autofocus_available,
             "fps": round(self._actual_fps or self.config.fps, 2),
+            "mjpeg_fps": round(self._actual_fps or self.config.fps, 2),
+            "detect_hz": round(snap.detect_hz, 2),
+            "tick_ms": round(snap.tick_ms, 1),
             "timestamp": snap.timestamp,
             "frame": frame_info,
             "reject_reason": snap.reject_reason,
@@ -930,17 +964,21 @@ class LiveDebugViewer:
                 image = resize_debug_frame(image, self.config.max_width)
             return encode_jpeg(image, self.config.jpeg_quality)
 
-        debug_copy = frame.copy()
-        debug_copy = resize_debug_frame(debug_copy, self.config.max_width)
         if not self._logged_encode_format:
-            info = describe_preview_frame(debug_copy)
+            info = describe_preview_frame(frame)
             logger.info(
-                "event=preview_encode_format shape=%s dtype=%s means=%s assumed_order=RGB",
+                "event=preview_encode_format shape=%s dtype=%s means=%s assumed_order=RGB "
+                "note=preview_contract_before_overlay_resize",
                 info.get("shape"),
                 info.get("dtype"),
                 info.get("channel_means"),
             )
             self._logged_encode_format = True
-        if self.config.overlay:
-            debug_copy = draw_overlay(debug_copy, snap, self._actual_fps or self.config.fps)
-        return encode_jpeg(debug_copy, self.config.jpeg_quality)
+        image = compose_debug_frame(
+            frame,
+            snap,
+            self._actual_fps or self.config.fps,
+            self.config.max_width,
+            overlay=self.config.overlay,
+        )
+        return encode_jpeg(image, self.config.jpeg_quality)
