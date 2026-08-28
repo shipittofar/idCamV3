@@ -10,6 +10,11 @@ import numpy as np
 
 from idcam.config.schema import DetectionConfig
 from idcam.logging.setup import get_logger
+from idcam.vision.geometry import (
+    bbox_from_corners,
+    find_document_quad,
+    order_corners,
+)
 from idcam.vision.sharpness import clip_roi
 
 logger = get_logger("vision.document_detector")
@@ -45,6 +50,38 @@ class DocumentDetectionDebug:
     document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
+@dataclass(frozen=True)
+class DocumentGeometryResult:
+    """Canonical document geometry in preview pixels. Not motion-based."""
+
+    present: bool
+    confidence: float
+    corners: tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]] | None
+    bbox: tuple[int, int, int, int] | None
+    reason: str
+    candidate_count: int = 0
+    selected_area_ratio: float = 0.0
+    aspect_ratio: float = 0.0
+    rectangularity: float = 0.0
+
+    def corners_array(self) -> np.ndarray | None:
+        if self.corners is None:
+            return None
+        return np.asarray(self.corners, dtype=np.float32)
+
+
+def _corners_tuple(
+    corners: np.ndarray,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
+    pts = order_corners(corners)
+    return (
+        (float(pts[0, 0]), float(pts[0, 1])),
+        (float(pts[1, 0]), float(pts[1, 1])),
+        (float(pts[2, 0]), float(pts[2, 1])),
+        (float(pts[3, 0]), float(pts[3, 1])),
+    )
+
+
 def gradient_edge_density(gray: np.ndarray, magnitude_threshold: float = 30.0) -> float:
     """Fraction of ROI pixels with Sobel magnitude above ``magnitude_threshold``.
 
@@ -64,10 +101,11 @@ def gradient_edge_density(gray: np.ndarray, magnitude_threshold: float = 30.0) -
 
 
 class DocumentDetector:
-    """
-    Detects document presence using frame differencing and edge density in ROI.
+    """Document presence from preview frames.
 
-    Distinguishes: no document, entering, moving, stable, ready.
+    ``detect_geometry`` is the Phase 2B API: quadrilateral in the current frame.
+    ``detect`` / ``classify`` remain the legacy motion+edge path used by the
+    orchestrator until Phase 2C wiring.
     """
 
     def __init__(self, config: DetectionConfig) -> None:
@@ -85,6 +123,11 @@ class DocumentDetector:
         self._prev_gray: np.ndarray | None = None
         self._last_frame_motion = 0.0
         self._last_document_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._geom_corners: np.ndarray | None = None
+        self._geom_misses = 0
+        self._last_geometry = DocumentGeometryResult(
+            present=False, confidence=0.0, corners=None, bbox=None, reason="no_frame"
+        )
 
     @property
     def last_motion(self) -> float:
@@ -106,49 +149,116 @@ class DocumentDetector:
         return int(x0), int(y0), int(rw), int(rh)
 
     def document_preview_roi(self, frame: np.ndarray | None = None) -> tuple[int, int, int, int]:
-        """Document bounding box in preview pixels, else the centered detection ROI.
+        """Axis-aligned document box in preview pixels, or the search ROI.
 
-        Coordinates are (x, y, width, height) in the current preview frame,
-        matching laplacian_variance / AfWindows mapping — not sensor pixels.
+        When ``detect_geometry`` has a live quad, that bbox is canonical.
+        The Otsu largest-blob box is no longer a competing document ROI.
         """
-        if frame is None:
-            if self._last_document_roi != (0, 0, 0, 0):
-                return self._last_document_roi
-            return self.roi_rect()
-        center = self.roi_rect(frame.shape)
-        tight = self._tight_document_box(frame, center)
-        self._last_document_roi = clip_roi(tight, frame.shape)
-        return self._last_document_roi
+        shape = None if frame is None else frame.shape
+        if self._last_geometry.present and self._last_geometry.bbox is not None:
+            if shape is not None:
+                return clip_roi(self._last_geometry.bbox, shape)
+            return self._last_geometry.bbox
+        if self._last_document_roi != (0, 0, 0, 0):
+            if shape is not None:
+                return clip_roi(self._last_document_roi, shape)
+            return self._last_document_roi
+        return self.roi_rect(shape)
 
-    def _tight_document_box(
-        self,
-        frame: np.ndarray,
-        center: tuple[int, int, int, int],
-    ) -> tuple[int, int, int, int]:
-        x0, y0, rw, rh = center
-        roi = self._to_gray(frame[y0 : y0 + rh, x0 : x0 + rw])
-        if roi.size == 0:
-            return center
-        work = np.ascontiguousarray(roi)
-        if work.dtype != np.uint8:
-            work = np.clip(work, 0, 255).astype(np.uint8)
-        blur = cv2.GaussianBlur(work, (5, 5), 0)
-        _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return center
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) < 0.08 * float(rw * rh):
-            return center
-        bx, by, bw, bh = cv2.boundingRect(contour)
-        pad_x = max(4, int(bw * 0.06))
-        pad_y = max(4, int(bh * 0.06))
-        return (
-            x0 + bx - pad_x,
-            y0 + by - pad_y,
-            bw + 2 * pad_x,
-            bh + 2 * pad_y,
+    def detect_geometry(self, frame: np.ndarray) -> DocumentGeometryResult:
+        """Detect a document quadrilateral in ``frame`` (preview pixels).
+
+        Does not require an empty-scene baseline. Does not mutate ``frame``.
+        Temporal hysteresis is local to this detector (not StabilityDetector).
+        """
+        h, w = int(frame.shape[0]), int(frame.shape[1])
+        self._last_frame_size = (w, h)
+        was_present = self._last_geometry.present
+        raw, candidate_count = find_document_quad(frame)
+        alpha = float(self.config.geometry_smooth_alpha)
+        hold = int(self.config.geometry_hold_frames)
+
+        if raw is not None:
+            corners = self._smooth_corners(raw.corners, alpha)
+            bbox = bbox_from_corners(corners)
+            bbox = clip_roi(bbox, frame.shape)
+            self._geom_corners = corners
+            self._geom_misses = 0
+            self._last_document_roi = bbox
+            result = DocumentGeometryResult(
+                present=True,
+                confidence=float(raw.confidence),
+                corners=_corners_tuple(corners),
+                bbox=bbox,
+                reason="quad",
+                candidate_count=candidate_count,
+                selected_area_ratio=float(raw.area_ratio),
+                aspect_ratio=float(raw.aspect_ratio),
+                rectangularity=float(raw.rectangularity),
+            )
+            self._last_geometry = result
+            if not was_present:
+                logger.info(
+                    "event=document_geometry present=1 confidence=%.3f reason=quad "
+                    "candidates=%d area_ratio=%.3f aspect=%.3f rectangularity=%.3f "
+                    "bbox=%d,%d,%d,%d",
+                    result.confidence,
+                    candidate_count,
+                    result.selected_area_ratio,
+                    result.aspect_ratio,
+                    result.rectangularity,
+                    *bbox,
+                )
+            return result
+
+        self._geom_misses += 1
+        if self._geom_corners is not None and self._geom_misses < hold:
+            bbox = bbox_from_corners(self._geom_corners)
+            bbox = clip_roi(bbox, frame.shape)
+            self._last_document_roi = bbox
+            result = DocumentGeometryResult(
+                present=True,
+                confidence=self._last_geometry.confidence,
+                corners=_corners_tuple(self._geom_corners),
+                bbox=bbox,
+                reason="geometry_held",
+                candidate_count=0,
+                selected_area_ratio=self._last_geometry.selected_area_ratio,
+                aspect_ratio=self._last_geometry.aspect_ratio,
+                rectangularity=self._last_geometry.rectangularity,
+            )
+            self._last_geometry = result
+            return result
+
+        self._geom_corners = None
+        self._last_document_roi = (0, 0, 0, 0)
+        reason = "no_quadrilateral" if candidate_count == 0 else "below_geometry_confidence"
+        result = DocumentGeometryResult(
+            present=False,
+            confidence=0.0,
+            corners=None,
+            bbox=None,
+            reason=reason,
+            candidate_count=candidate_count,
         )
+        if self._last_geometry.present:
+            logger.info(
+                "event=document_geometry present=0 reason=%s hold_expired misses=%d",
+                reason,
+                self._geom_misses,
+            )
+        self._last_geometry = result
+        return result
+
+    def last_geometry(self) -> DocumentGeometryResult:
+        return self._last_geometry
+
+    def _smooth_corners(self, corners: np.ndarray, alpha: float) -> np.ndarray:
+        ordered = order_corners(corners)
+        if self._geom_corners is None or self._geom_corners.shape != ordered.shape:
+            return ordered
+        prev = order_corners(self._geom_corners)
+        return (alpha * ordered + (1.0 - alpha) * prev).astype(np.float32)
 
     def debug_info(self) -> DocumentDetectionDebug:
         """Return last computed metrics. Does not run detection or mutate state."""
@@ -182,6 +292,11 @@ class DocumentDetector:
         self._last_frame_motion = 0.0
         self._last_document_roi = (0, 0, 0, 0)
         self._last_reject_reason = "no_frame"
+        self._geom_corners = None
+        self._geom_misses = 0
+        self._last_geometry = DocumentGeometryResult(
+            present=False, confidence=0.0, corners=None, bbox=None, reason="reset"
+        )
 
     def update_baseline(self, frame: np.ndarray) -> None:
         """Update baseline from a stable empty scene."""
@@ -252,7 +367,6 @@ class DocumentDetector:
             return DocumentPresence.NO_DOCUMENT
 
         self._presence_frames += 1
-        self.document_preview_roi(frame)
         if self._presence_frames < 2:
             return DocumentPresence.DOCUMENT_ENTERING
         if self._last_frame_motion > self.config.motion_threshold * 1.5:

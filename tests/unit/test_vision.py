@@ -5,7 +5,14 @@ import numpy as np
 import pytest
 
 from idcam.config.schema import DetectionConfig
-from idcam.vision.document_detector import DocumentDetector, DocumentDetectionDebug, DocumentPresence, gradient_edge_density
+from idcam.vision.document_detector import (
+    DocumentDetector,
+    DocumentDetectionDebug,
+    DocumentGeometryResult,
+    DocumentPresence,
+    gradient_edge_density,
+)
+from idcam.vision.geometry import bbox_from_corners, bbox_iou, order_corners
 from idcam.vision.sharpness import laplacian_variance, mean_brightness
 from idcam.vision.stability_detector import StabilityDetector
 
@@ -197,21 +204,248 @@ class TestDocumentPreviewRoi:
     def test_roi_is_preview_pixels_inside_frame(self, detection_config):
         detector = DocumentDetector(detection_config)
         empty = np.full((1080, 1920, 3), 200, dtype=np.uint8)
-        doc = empty.copy()
-        doc[200:880, 400:1520] = 40
-        doc[200:230, 400:1520] = 0
-        doc[850:880, 400:1520] = 0
-        detector.update_baseline(empty)
-        detector.detect(doc)
+        doc = _page_on_table((1080, 1920), (400, 200, 1120, 680))
+        geom = detector.detect_geometry(doc)
+        assert geom.present is True
         roi = detector.document_preview_roi(doc)
         x, y, w, h = roi
         assert x >= 0 and y >= 0
         assert x + w <= 1920
         assert y + h <= 1080
         assert w > 100 and h > 100
-        # Must not look like the old sensor-space debug window.
         assert roi != (1936, 1960, 5376, 3024)
-        assert x + w <= 1920
+
+
+def _wood_table(shape: tuple[int, int], *, brightness: int = 0) -> np.ndarray:
+    h, w = shape
+    yy, xx = np.indices((h, w))
+    base = (85 + (xx * 3 + yy * 5) % 45).astype(np.int16) + brightness
+    base = np.clip(base, 0, 255).astype(np.uint8)
+    g = (base.astype(np.int16) * 70 // 100).clip(0, 255).astype(np.uint8)
+    b = (base.astype(np.int16) * 48 // 100).clip(0, 255).astype(np.uint8)
+    return np.stack([base, g, b], axis=-1)
+
+
+def _draw_page(frame: np.ndarray, x: int, y: int, pw: int, ph: int, *, printed: bool = False) -> np.ndarray:
+    img = frame.copy()
+    img[y : y + ph, x : x + pw] = (242, 238, 230)
+    img[y : y + 3, x : x + pw] = 35
+    img[y + ph - 3 : y + ph, x : x + pw] = 35
+    img[y : y + ph, x : x + 3] = 35
+    img[y : y + ph, x + pw - 3 : x + pw] = 35
+    if printed:
+        for row in range(y + 20, y + ph - 20, 14):
+            img[row : row + 3, x + 24 : x + pw - 24] = (25, 25, 30)
+    return img
+
+
+def _page_on_table(shape: tuple[int, int], box: tuple[int, int, int, int], *, printed: bool = False) -> np.ndarray:
+    return _draw_page(_wood_table(shape), *box, printed=printed)
+
+
+def _perspective_page(shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """White page with mild perspective. Corners are the drawn polygon (TL TR BR BL)."""
+    h, w = shape
+    img = _wood_table(shape)
+    corners = np.array(
+        [
+            [int(w * 0.18), int(h * 0.16)],
+            [int(w * 0.84), int(h * 0.12)],
+            [int(w * 0.88), int(h * 0.86)],
+            [int(w * 0.14), int(h * 0.82)],
+        ],
+        dtype=np.int32,
+    )
+    cv2.fillConvexPoly(img, corners, (244, 240, 232))
+    cv2.polylines(img, [corners], True, (28, 28, 28), 4, cv2.LINE_AA)
+    return img, corners.astype(np.float32)
+
+
+class TestDocumentGeometry:
+    def test_page_present_at_t0_without_baseline(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = _page_on_table((480, 640), (80, 60, 480, 360))
+        geom = detector.detect_geometry(frame)
+        assert geom.present is True
+        assert geom.corners is not None
+        assert geom.bbox is not None
+        assert geom.confidence > 0.48
+
+    def test_page_after_empty_frame(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        empty = _wood_table((480, 640))
+        assert detector.detect_geometry(empty).present is False
+        page = _page_on_table((480, 640), (80, 60, 480, 360))
+        assert detector.detect_geometry(page).present is True
+
+    def test_slowly_introduced_page_does_not_use_motion_threshold(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        table = _wood_table((480, 640))
+        found = False
+        for width in (40, 80, 160, 280, 420):
+            frame = _draw_page(table, 80, 70, width, int(width * 0.72))
+            geom = detector.detect_geometry(frame)
+            if geom.present:
+                found = True
+                break
+        assert found is True
+
+    def test_empty_uniform_scene(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = np.full((480, 640, 3), 128, dtype=np.uint8)
+        geom = detector.detect_geometry(frame)
+        assert geom.present is False
+        assert geom.corners is None
+
+    def test_textured_empty_table(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        geom = detector.detect_geometry(_wood_table((480, 640)))
+        assert geom.present is False
+
+    def test_textured_table_brightness_shift_is_not_a_document(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        table = _wood_table((480, 640), brightness=0)
+        assert detector.detect_geometry(table).present is False
+        shifted = _wood_table((480, 640), brightness=28)
+        geom = detector.detect_geometry(shifted)
+        assert geom.present is False
+
+    def test_hand_like_blob_rejected(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = _wood_table((480, 640))
+        cv2.circle(frame, (320, 240), 70, (210, 160, 140), -1)
+        cv2.circle(frame, (370, 200), 35, (210, 160, 140), -1)
+        cv2.circle(frame, (390, 250), 28, (210, 160, 140), -1)
+        geom = detector.detect_geometry(frame)
+        assert geom.present is False
+
+    def test_shadow_gradient_is_not_a_document(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = _wood_table((480, 640)).astype(np.int16)
+        shade = np.linspace(0, 50, 640, dtype=np.int16)
+        frame -= shade[None, :, None]
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+        geom = detector.detect_geometry(frame)
+        assert geom.present is False
+
+    def test_perspective_document_returns_four_ordered_corners(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame, truth = _perspective_page((720, 960))
+        geom = detector.detect_geometry(frame)
+        assert geom.present is True
+        assert geom.corners is not None
+        assert len(geom.corners) == 4
+        ordered = order_corners(np.asarray(geom.corners))
+        assert ordered[0, 0] + ordered[0, 1] <= ordered[2, 0] + ordered[2, 1]
+        assert ordered[1, 0] >= ordered[0, 0]
+        assert ordered[3, 1] >= ordered[0, 1]
+
+    def test_corner_order_is_tl_tr_br_bl(self):
+        pts = np.array([[200.0, 10.0], [10.0, 10.0], [10.0, 90.0], [200.0, 90.0]])
+        ordered = order_corners(pts)
+        np.testing.assert_allclose(ordered[0], [10, 10])
+        np.testing.assert_allclose(ordered[1], [200, 10])
+        np.testing.assert_allclose(ordered[2], [200, 90])
+        np.testing.assert_allclose(ordered[3], [10, 90])
+
+    def test_bbox_encloses_corners(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = _page_on_table((480, 640), (80, 60, 480, 360))
+        geom = detector.detect_geometry(frame)
+        assert geom.present and geom.bbox and geom.corners
+        x, y, w, h = geom.bbox
+        for cx, cy in geom.corners:
+            assert x - 2 <= cx <= x + w + 2
+            assert y - 2 <= cy <= y + h + 2
+        enclosed = bbox_from_corners(np.asarray(geom.corners))
+        assert bbox_iou(geom.bbox, enclosed) > 0.98
+
+    def test_forty_percent_page_iou(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        # 1200×720 on 1920×1080 ≈ 41.7% of the frame.
+        box = (360, 180, 1200, 720)
+        frame = _page_on_table((1080, 1920), box)
+        geom = detector.detect_geometry(frame)
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert bbox_iou(geom.bbox, box) > 0.80
+
+    def test_printed_document(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = _page_on_table((480, 640), (70, 50, 500, 380), printed=True)
+        assert detector.detect_geometry(frame).present is True
+
+    def test_mildly_defocused_document(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        sharp = _page_on_table((480, 640), (80, 60, 480, 360), printed=True)
+        mild = cv2.GaussianBlur(sharp, (9, 9), 0)
+        geom = detector.detect_geometry(mild)
+        assert geom.present is True
+
+    def test_corner_jitter_is_smoothed(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        base = _page_on_table((480, 640), (80, 60, 480, 360))
+        detector.detect_geometry(base)
+        outputs = []
+        for dx in (0, 3, -2, 4, -3, 1):
+            shifted = np.roll(base, dx, axis=1)
+            geom = detector.detect_geometry(shifted)
+            assert geom.present is True
+            outputs.append(np.asarray(geom.corners)[:, 0].mean())
+        raw_span = 4 - (-3)
+        out_span = max(outputs) - min(outputs)
+        assert out_span < raw_span
+
+    def test_one_bad_frame_does_not_drop_document(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        page = _page_on_table((480, 640), (80, 60, 480, 360))
+        empty = _wood_table((480, 640))
+        for _ in range(3):
+            assert detector.detect_geometry(page).present is True
+        held = detector.detect_geometry(empty)
+        assert held.present is True
+        assert held.reason == "geometry_held"
+
+    def test_removal_requires_consecutive_misses(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        page = _page_on_table((480, 640), (80, 60, 480, 360))
+        empty = _wood_table((480, 640))
+        detector.detect_geometry(page)
+        hold = detection_config.geometry_hold_frames
+        still = []
+        gone = None
+        for i in range(hold + 2):
+            geom = detector.detect_geometry(empty)
+            still.append(geom.present)
+            if not geom.present:
+                gone = i
+                break
+        assert gone is not None
+        assert gone >= hold - 1
+        assert still[0] is True
+
+    def test_does_not_mutate_input(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        frame = _page_on_table((480, 640), (80, 60, 480, 360))
+        original = frame.copy()
+        detector.detect_geometry(frame)
+        assert np.array_equal(frame, original)
+
+    def test_no_quad_is_not_present(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        geom = detector.detect_geometry(np.full((240, 320, 3), 40, dtype=np.uint8))
+        assert geom.present is False
+        assert isinstance(geom, DocumentGeometryResult)
+
+    def test_coordinates_are_preview_pixels_on_1080p(self, detection_config):
+        detector = DocumentDetector(detection_config)
+        box = (400, 200, 1120, 680)
+        frame = _page_on_table((1080, 1920), box)
+        geom = detector.detect_geometry(frame)
+        assert geom.present is True
+        for cx, cy in geom.corners or ():
+            assert 0 <= cx < 1920
+            assert 0 <= cy < 1080
 
 
 class TestSharpness:

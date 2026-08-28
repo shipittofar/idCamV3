@@ -88,6 +88,9 @@ class DetectionConfig(BaseModel):
     removal_motion_factor: float = Field(0.5, gt=0, le=1.0)
     removal_edge_factor: float = Field(0.5, gt=0, le=2.0)
     baseline_alpha: float = Field(0.05, gt=0, le=1.0)
+    # Geometry detector (Phase 2B). Independent of motion_threshold.
+    geometry_hold_frames: int = Field(3, ge=1, le=30)
+    geometry_smooth_alpha: float = Field(0.40, gt=0, le=1.0)
 
 
 class QualityConfig(BaseModel):
