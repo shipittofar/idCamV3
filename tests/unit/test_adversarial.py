@@ -90,7 +90,7 @@ class TestOneShotStates:
     @pytest.mark.asyncio
     async def test_focusing_not_reentered_same_state(self, app_config):
         orch = _make_orch(app_config)
-        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1", trigger="manual")
         orch.sm.state = AppState.FOCUSING
         call_count = 0
 
@@ -133,7 +133,7 @@ class TestMotionDuringCapture:
     @pytest.mark.asyncio
     async def test_lens_motion_during_focus_does_not_abort(self, app_config):
         orch = _make_orch(app_config)
-        orch._transaction = ActiveCaptureTransaction(capture_id="cap-move")
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-move", trigger="manual")
         orch.sm.state = AppState.FOCUSING
         orch.detector.classify = MagicMock(return_value=__import__(
             "idcam.vision.document_detector", fromlist=["DocumentPresence"]

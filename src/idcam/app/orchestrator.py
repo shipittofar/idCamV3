@@ -14,7 +14,7 @@ from idcam.app.state_machine import AppState, StateMachine
 from idcam.app.transaction import ActiveCaptureTransaction, TransactionPhase
 from idcam.camera.autofocus import AutofocusController
 from idcam.camera.capture import CaptureService
-from idcam.camera.manager import CameraManager, describe_preview_frame
+from idcam.camera.manager import CameraManager, describe_preview_frame, preview_roi_is_usable
 from idcam.camera.quality import ImageValidator
 from idcam.config.schema import AppConfig
 from idcam.exceptions import (
@@ -362,12 +362,22 @@ class ApplicationOrchestrator:
             return
         self._accepted_geometry = None
 
-    def _accepted_preview_roi(self, frame=None) -> tuple[int, int, int, int]:
+    def _accepted_preview_roi(self, frame=None, *, allow_search_fallback: bool = True) -> tuple[int, int, int, int] | None:
         geom = self._accepted_geometry
-        if geom is not None and geom.bbox is not None:
+        if geom is not None:
+            if geom.bbox is None:
+                return None
             if frame is not None:
-                return clip_roi(geom.bbox, frame.shape)
+                roi = clip_roi(geom.bbox, frame.shape)
+                size = (int(frame.shape[1]), int(frame.shape[0]))
+                if not preview_roi_is_usable(roi, size):
+                    return None
+                return roi
+            if geom.bbox[2] < 8 or geom.bbox[3] < 8:
+                return None
             return geom.bbox
+        if not allow_search_fallback:
+            return None
         return self.detector.document_preview_roi(frame)
 
     def _observe_geometry(self, frame) -> tuple[DocumentGeometryResult, bool]:
@@ -664,7 +674,13 @@ class ApplicationOrchestrator:
         frame = await self._safe_preview()
         if frame is None:
             return
-        preview_roi = self._accepted_preview_roi(frame)
+        auto = self._transaction.trigger == "auto"
+        preview_roi = self._accepted_preview_roi(frame, allow_search_fallback=not auto)
+        require_document_roi = auto or self._accepted_geometry is not None
+        if require_document_roi and preview_roi is None:
+            logger.error("event=autofocus_failure reason=invalid_roi capture_id=%s", self._transaction.capture_id)
+            await self._fail_transaction_and_wait("focus_failed", "invalid_roi: no accepted document geometry")
+            return
         self._publish_debug(frame)
         self._transaction.mark_focus_started()
         self._transaction.focus_attempts += 1
@@ -687,18 +703,31 @@ class ApplicationOrchestrator:
                 sharpness_threshold=min_sharp,
                 roi_fraction=self.config.detection.roi_center_fraction,
                 preview_roi=preview_roi,
+                require_document_roi=require_document_roi,
             )
+            if self._accepted_geometry is not None:
+                check_frame = await self._safe_preview()
+                if check_frame is not None:
+                    moved, displacement = self._geometry_moved_readonly(check_frame)
+                    if moved:
+                        raise AutofocusError(
+                            f"document moved during autofocus displacement_px={displacement:.1f}"
+                        )
             pause = getattr(self.camera, "pause_autofocus", None)
-            if callable(pause):
+            if callable(pause) and not result.lens_locked:
                 await asyncio.to_thread(pause)
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
             logger.info(
-                "event=autofocus_result capture_id=%s success=1 method=%s sharpness=%.1f ratio=%.2f",
+                "event=autofocus_result capture_id=%s success=1 method=%s sharpness=%.1f "
+                "ratio=%.2f duration_ms=%.0f lens_locked=%s roi=%s",
                 self._transaction.capture_id,
                 result.method,
                 result.sharpness,
                 result.improvement_ratio,
+                result.duration_ms,
+                int(result.lens_locked),
+                result.roi,
             )
             logger.info(
                 "event=pipeline_stage stage=focus_verification method=%s sharpness=%.1f ratio=%.2f",
@@ -721,13 +750,20 @@ class ApplicationOrchestrator:
         assert self._transaction is not None
         min_sharp = self.config.quality.min_sharpness * 0.6
         self._transaction.focus_verify_attempts += 1
-        preview_roi = self._accepted_preview_roi()
+        preview_roi = self._accepted_preview_roi(
+            allow_search_fallback=self._transaction.trigger != "auto"
+        )
+        require_document_roi = self._transaction.trigger == "auto" or self._accepted_geometry is not None
+        if require_document_roi and preview_roi is None:
+            await self._fail_transaction_and_wait("focus_failed", "invalid_roi: no accepted document geometry")
+            return
         try:
             result = await self.autofocus.verify_focus(
                 self.camera,
                 sharpness_threshold=min_sharp,
                 roi_fraction=self.config.detection.roi_center_fraction,
                 preview_roi=preview_roi,
+                require_document_roi=require_document_roi,
             )
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()

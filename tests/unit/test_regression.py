@@ -89,7 +89,7 @@ class TestOneShotRegression:
     @pytest.mark.asyncio
     async def test_focus_refocus_allows_second_autofocus_run(self, app_config):
         orch = _make_orch(app_config)
-        orch._transaction = ActiveCaptureTransaction(capture_id="cap-refocus")
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-refocus", trigger="manual")
         orch.sm.state = AppState.FOCUS_VERIFICATION
         call_count = 0
 

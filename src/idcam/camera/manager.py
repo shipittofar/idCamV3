@@ -35,6 +35,9 @@ _AF_STATE_FAILED = 3
 _AF_METERING_WINDOWS = 1
 _AF_RANGE_FULL = 2
 
+# Preview-pixel AfWindows source must be large enough to map to a real sensor window.
+MIN_PREVIEW_AF_SIDE = 8
+
 # Passed explicitly to every still encoder so the container is never inferred
 # from the output filename.
 STILL_ENCODER_FORMAT = "jpeg"
@@ -112,6 +115,71 @@ def clip_preview_roi(
     rw = max(1, min(rw, fw - x))
     rh = max(1, min(rh, fh - y))
     return x, y, rw, rh
+
+
+def clip_xywh_to_bounds(
+    roi: tuple[int, int, int, int],
+    bounds: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Clip ``roi`` so it lies entirely inside ``bounds`` (both xywh)."""
+    bx, by, bw, bh = (int(v) for v in bounds)
+    x, y, rw, rh = (int(v) for v in roi)
+    x2 = min(x + rw, bx + bw)
+    y2 = min(y + rh, by + bh)
+    x = max(x, bx)
+    y = max(y, by)
+    rw = x2 - x
+    rh = y2 - y
+    if rw < 1 or rh < 1:
+        raise ValueError("af_window_empty")
+    return int(x), int(y), int(rw), int(rh)
+
+
+def preview_roi_is_usable(
+    roi: tuple[int, int, int, int] | None,
+    preview_size: tuple[int, int],
+    *,
+    min_side: int = MIN_PREVIEW_AF_SIDE,
+) -> bool:
+    """True when ``roi`` is a finite rectangle that clips to a usable preview window."""
+    if roi is None:
+        return False
+    try:
+        x, y, rw, rh = (int(v) for v in roi)
+    except (TypeError, ValueError):
+        return False
+    if rw <= 0 or rh <= 0:
+        return False
+    fw, fh = int(preview_size[0]), int(preview_size[1])
+    if fw <= 0 or fh <= 0:
+        return False
+    clipped = clip_preview_roi((x, y, rw, rh), preview_size)
+    return clipped[2] >= min_side and clipped[3] >= min_side
+
+
+def preview_roi_to_af_window(
+    preview_roi: tuple[int, int, int, int],
+    preview_size: tuple[int, int],
+    scaler_crop: tuple[int, int, int, int],
+) -> dict[str, tuple[int, int, int, int]]:
+    """Convert a preview-pixel document bbox to AfWindows (ScalerCrop) coordinates.
+
+    Raises ValueError for empty, inverted, or unusable geometry. Never substitutes
+    a centered search rectangle.
+    """
+    fw, fh = int(preview_size[0]), int(preview_size[1])
+    if fw <= 0 or fh <= 0:
+        raise ValueError("invalid_preview_size")
+    if not preview_roi_is_usable(preview_roi, preview_size):
+        raise ValueError("invalid_roi")
+    clipped = clip_preview_roi(tuple(int(v) for v in preview_roi), preview_size)
+    mapped = map_preview_roi_to_sensor(clipped, preview_size, scaler_crop)
+    sensor = clip_xywh_to_bounds(mapped, scaler_crop)
+    return {
+        "preview_roi": clipped,
+        "sensor_roi": sensor,
+        "scaler_crop": tuple(int(v) for v in scaler_crop),
+    }
 
 
 def normalize_picamera_preview_frame(frame: np.ndarray) -> np.ndarray:
@@ -433,9 +501,13 @@ class CameraManager:
         """Point hardware AF at a preview-pixel ROI mapped through live ScalerCrop."""
         with self._lock:
             fw, fh = int(preview_size[0]), int(preview_size[1])
-            clipped = clip_preview_roi(preview_roi, (fw, fh))
             scaler = self._current_scaler_crop_unlocked()
-            sensor = map_preview_roi_to_sensor(clipped, (fw, fh), scaler)
+            try:
+                mapped = preview_roi_to_af_window(preview_roi, (fw, fh), scaler)
+            except ValueError as exc:
+                raise CameraError(f"Invalid document AF ROI: {exc}") from exc
+            clipped = mapped["preview_roi"]
+            sensor = mapped["sensor_roi"]
             if not self._use_mock and self._picam2 is not None:
                 x, y, w, h = sensor
                 self._set_controls_unlocked(
@@ -527,12 +599,16 @@ class CameraManager:
             advertised = self._picam2.camera_controls
             if "AfPause" in advertised:
                 self._set_controls_unlocked({"AfPause": 0})
-                logger.info("event=autofocus_triggered method=pause")
+                logger.info("event=lens_lock method=af_pause")
             elif "AfMode" in advertised and "LensPosition" in advertised:
                 lens = self._read_lens_position()
                 if lens is not None:
                     self._set_controls_unlocked({"AfMode": self._af_mode_manual(), "LensPosition": lens})
-                    logger.info("event=autofocus_result method=hold_lens_position lens_position=%s", lens)
+                    logger.info("event=lens_lock method=hold_lens_position lens_position=%s", lens)
+                else:
+                    logger.warning("event=lens_lock success=0 reason=lens_position_unavailable")
+            else:
+                logger.warning("event=lens_lock success=0 reason=no_pause_or_manual_controls")
 
     def _af_enum(self, group: str, name: str, fallback: int) -> int:
         if controls is None:

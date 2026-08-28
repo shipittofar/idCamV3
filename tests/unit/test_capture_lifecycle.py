@@ -15,7 +15,7 @@ from idcam.config.schema import AppConfig, CameraConfig, DetectionConfig, Qualit
 from idcam.exceptions import AutofocusError, CaptureError
 from idcam.network.protocol import ServerResponse, UploadOutcome
 from idcam.system.component_health import ComponentStatus, HealthLevel
-from idcam.vision.document_detector import DocumentDetector
+from idcam.vision.document_detector import DocumentDetector, DocumentGeometryResult
 
 
 @pytest.fixture
@@ -138,7 +138,9 @@ class TestAutoCapturePath:
         orch = _orch(app_config)
         orch.sm.state = AppState.FOCUSING
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
-        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        page = _document_frame()
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
         orch._check_motion_abort = AsyncMock(return_value=True)
         orch.autofocus.run_autofocus = AsyncMock(
             return_value=AutofocusResult(True, 90.0, 1, None, "hardware_cycle", 10.0)
@@ -621,6 +623,51 @@ class TestPhase2DFocusCaptureHandoff:
         assert orch._accepted_preview_roi(page) == geom.bbox
         empty = _empty_frame()
         assert orch._accepted_preview_roi(empty) == geom.bbox
+
+    @pytest.mark.asyncio
+    async def test_auto_focusing_without_geometry_does_not_center_af(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.FOCUSING
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1", trigger="auto")
+        orch._safe_preview = AsyncMock(return_value=_empty_frame())
+        orch.autofocus.run_autofocus = AsyncMock()
+        await orch._focusing_tick()
+        orch.autofocus.run_autofocus.assert_not_called()
+        assert orch.sm.state != AppState.FOCUS_VERIFICATION
+        assert orch._awaiting_clear_scene is True
+
+    @pytest.mark.asyncio
+    async def test_invalid_accepted_bbox_does_not_fall_back_to_search(self, app_config):
+        orch = _orch(app_config)
+        page = _document_frame()
+        search = orch.detector.roi_rect(page.shape)
+        orch._accepted_geometry = DocumentGeometryResult(
+            present=True,
+            confidence=0.9,
+            corners=((0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)),
+            bbox=(0, 0, 2, 2),
+            reason="quad",
+        )
+        assert orch._accepted_preview_roi(page, allow_search_fallback=False) is None
+        assert orch._accepted_preview_roi(page, allow_search_fallback=False) != search
+
+    @pytest.mark.asyncio
+    async def test_document_moved_after_af_is_not_accepted(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.FOCUSING
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        still = _document_frame(box=(80, 60, 480, 360))
+        moved = _document_frame(box=(180, 120, 400, 300))
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(still))
+        orch._safe_preview = AsyncMock(side_effect=[still, moved])
+        orch.autofocus.run_autofocus = AsyncMock(
+            return_value=AutofocusResult(True, 90.0, 1, None, "hardware_cycle", 10.0)
+        )
+        await orch._focusing_tick()
+        assert orch.sm.state != AppState.FOCUS_VERIFICATION
+        assert orch._awaiting_clear_scene is True
 
 
 

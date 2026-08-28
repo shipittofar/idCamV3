@@ -9,7 +9,13 @@ import numpy as np
 import pytest
 
 from idcam.camera.autofocus import AutofocusController
-from idcam.camera.manager import map_preview_roi_to_sensor, parse_xywh
+from idcam.camera.manager import (
+    map_preview_roi_to_sensor,
+    parse_xywh,
+    preview_roi_is_usable,
+    preview_roi_to_af_window,
+    clip_xywh_to_bounds,
+)
 from idcam.config.schema import CameraConfig
 from idcam.exceptions import AutofocusError
 from idcam.vision.sharpness import accept_preview_focus
@@ -44,6 +50,7 @@ class FakeCamera:
         self.set_calls: list[dict[str, Any]] = []
         self.metadata_calls = 0
         self.controls_calls = 0
+        self.pause_calls = 0
 
     def get_controls(self) -> dict[str, Any]:
         self.controls_calls += 1
@@ -70,6 +77,9 @@ class FakeCamera:
             "sensor_roi": self.applied_roi,
         }
 
+    def pause_autofocus(self) -> None:
+        self.pause_calls = getattr(self, "pause_calls", 0) + 1
+
     def autofocus_cycle(self) -> Any:
         if not self.has_cycle:
             raise AssertionError("autofocus_cycle should not be called")
@@ -78,6 +88,9 @@ class FakeCamera:
 
     def capture_preview_array(self) -> np.ndarray:
         return _sharp_frame()
+
+    def pause_autofocus(self) -> None:
+        self.pause_calls += 1
 
 
 class TestAutofocusController:
@@ -255,4 +268,120 @@ class TestPreviewFocusAcceptance:
             result = await ctl.verify_focus(camera, sharpness_threshold=48.0)
         assert result.success is True
         assert result.sharpness == 28.0
+
+
+class TestAfWindowsFromPreview:
+    def test_off_center_bbox_maps_to_sensor_not_frame_center(self):
+        preview_size = (1920, 1080)
+        scaler = (0, 898, 9152, 5148)
+        left = (40, 200, 480, 640)
+        mapped = preview_roi_to_af_window(left, preview_size, scaler)
+        center_search = preview_roi_to_af_window((288, 162, 1344, 756), preview_size, scaler)
+        assert mapped["preview_roi"][0] == 40
+        assert mapped["sensor_roi"] != center_search["sensor_roi"]
+        sx, sy, sw, sh = mapped["sensor_roi"]
+        bx, by, bw, bh = scaler
+        assert sx >= bx and sy >= by
+        assert sx + sw <= bx + bw + 1
+        assert sy + sh <= by + bh + 1
+
+    def test_af_windows_clamped_to_scaler_crop(self):
+        scaler = (0, 898, 9152, 5148)
+        overflowing = map_preview_roi_to_sensor((1900, 1060, 80, 80), (1920, 1080), scaler)
+        clamped = clip_xywh_to_bounds(overflowing, scaler)
+        assert clamped[0] >= scaler[0]
+        assert clamped[1] >= scaler[1]
+        assert clamped[0] + clamped[2] <= scaler[0] + scaler[2]
+        assert clamped[1] + clamped[3] <= scaler[1] + scaler[3]
+
+    def test_invalid_empty_geometry_rejected(self):
+        scaler = (0, 0, 1920, 1080)
+        with pytest.raises(ValueError, match="invalid_roi"):
+            preview_roi_to_af_window((0, 0, 0, 0), (1920, 1080), scaler)
+        with pytest.raises(ValueError, match="invalid_roi"):
+            preview_roi_to_af_window((10, 10, -4, 40), (1920, 1080), scaler)
+        assert preview_roi_is_usable((0, 0, 0, 0), (1920, 1080)) is False
+
+    def test_preview_to_sensor_scale_is_linear(self):
+        preview_size = (1920, 1080)
+        scaler = (100, 200, 1920, 1080)
+        roi = (96, 108, 192, 216)
+        mapped = preview_roi_to_af_window(roi, preview_size, scaler)
+        assert mapped["sensor_roi"] == (100 + 96, 200 + 108, 192, 216)
+
+
+class TestDocumentRoiAutofocusPolicy:
+    @pytest.mark.asyncio
+    async def test_uses_provided_document_roi_not_center(self):
+        camera = FakeCamera()
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
+        doc_roi = (20, 10, 90, 70)
+        rois: list = []
+
+        def spy(_frame, roi=None, roi_fraction=0.7):
+            rois.append(roi)
+            return 12.0 if len(rois) == 1 else 30.0
+
+        with patch("idcam.camera.autofocus.laplacian_variance", side_effect=spy):
+            result = await ctl.run_autofocus(
+                camera,
+                sharpness_threshold=48.0,
+                preview_roi=doc_roi,
+                require_document_roi=True,
+            )
+        assert result.success is True
+        assert result.roi == doc_roi
+        assert rois == [doc_roi, doc_roi]
+        assert camera.applied_roi == doc_roi
+        assert camera.pause_calls == 1
+        assert result.lens_locked is True
+        assert result.duration_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_require_document_roi_rejects_missing_and_tiny(self):
+        camera = FakeCamera()
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
+        with pytest.raises(AutofocusError, match="invalid_roi"):
+            await ctl.run_autofocus(camera, sharpness_threshold=1.0, require_document_roi=True)
+        with pytest.raises(AutofocusError, match="invalid_roi"):
+            await ctl.run_autofocus(
+                camera,
+                sharpness_threshold=1.0,
+                preview_roi=(0, 0, 2, 2),
+                require_document_roi=True,
+            )
+        assert camera.cycle_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_already_sharp_document_is_success(self):
+        camera = FakeCamera()
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
+        scores = iter([32.0, 31.5])
+        with patch("idcam.camera.autofocus.laplacian_variance", side_effect=lambda *_a, **_k: next(scores)):
+            result = await ctl.run_autofocus(
+                camera, sharpness_threshold=48.0, preview_roi=(20, 20, 80, 60), require_document_roi=True
+            )
+        assert result.success is True
+        assert result.improved is False
+
+    @pytest.mark.asyncio
+    async def test_failure_is_not_success(self):
+        class Blurry(FakeCamera):
+            def capture_preview_array(self) -> np.ndarray:
+                return np.full((80, 80, 3), 128, dtype=np.uint8)
+
+        camera = Blurry()
+        ctl = AutofocusController(CameraConfig(af_max_retries=1, af_timeout_sec=1.0))
+        ctl.probe_capabilities(camera)
+        with pytest.raises(AutofocusError):
+            await ctl.run_autofocus(
+                camera, sharpness_threshold=500.0, preview_roi=(8, 8, 40, 40), require_document_roi=True
+            )
+        assert camera.pause_calls == 0
+
+    def test_accept_already_sharp_near_floor(self):
+        assert accept_preview_focus(before=32.0, after=31.5, absolute_floor=28.0) is True
 

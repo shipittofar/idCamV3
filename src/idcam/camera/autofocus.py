@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from idcam.camera.manager import preview_roi_is_usable
 from idcam.config.schema import CameraConfig
 from idcam.exceptions import AutofocusError
 from idcam.logging.setup import get_logger
@@ -89,6 +90,8 @@ class AutofocusResult:
     improvement_ratio: float = 0.0
     sensor_roi: tuple[int, int, int, int] = (0, 0, 0, 0)
     preview_size: tuple[int, int] = (0, 0)
+    duration_ms: float = 0.0
+    lens_locked: bool = False
 
 
 @dataclass
@@ -165,9 +168,20 @@ class AutofocusController:
         frame: Any,
         roi_fraction: float,
         preview_roi: tuple[int, int, int, int] | None,
+        *,
+        require_document_roi: bool,
     ) -> tuple[int, int, int, int]:
+        size = (int(frame.shape[1]), int(frame.shape[0]))
         if preview_roi is not None:
-            return clip_roi(preview_roi, frame.shape)
+            clipped = clip_roi(preview_roi, frame.shape)
+            if require_document_roi:
+                if not preview_roi_is_usable(clipped, size):
+                    raise AutofocusError("invalid_roi: document ROI is empty or too small")
+            elif clipped[2] < 1 or clipped[3] < 1:
+                raise AutofocusError("invalid_roi: document ROI is empty or too small")
+            return clipped
+        if require_document_roi:
+            raise AutofocusError("invalid_roi: document ROI required")
         return clip_roi(self._center_roi(frame.shape, roi_fraction), frame.shape)
 
     async def run_autofocus(
@@ -177,6 +191,7 @@ class AutofocusController:
         sharpness_threshold: float,
         roi_fraction: float = 0.7,
         preview_roi: tuple[int, int, int, int] | None = None,
+        require_document_roi: bool = False,
     ) -> AutofocusResult:
         last_after = 0.0
         last_before = 0.0
@@ -188,6 +203,7 @@ class AutofocusController:
         last_ratio = 0.0
         last_method = "none"
         preview_size = (0, 0)
+        started = time.monotonic()
         # Absolute still-image floor must not veto a real preview improvement.
         preview_floor = min(float(sharpness_threshold), PREVIEW_ABSOLUTE_FLOOR)
 
@@ -199,7 +215,9 @@ class AutofocusController:
                     raise AutofocusError("Invalid preview frame for sharpness check")
                 h, w = int(preview.shape[0]), int(preview.shape[1])
                 preview_size = (w, h)
-                last_roi = self._resolve_preview_roi(preview, roi_fraction, preview_roi)
+                last_roi = self._resolve_preview_roi(
+                    preview, roi_fraction, preview_roi, require_document_roi=require_document_roi
+                )
                 mapping = await self._apply_document_roi(camera, last_roi, preview_size)
                 last_sensor = mapping.get("sensor_roi", last_roi)
                 last_before = laplacian_variance(preview, roi=last_roi)
@@ -283,8 +301,23 @@ class AutofocusController:
                 )
                 if accepted:
                     pause = getattr(camera, "pause_autofocus", None)
+                    locked = False
                     if callable(pause):
                         await asyncio.to_thread(pause)
+                        locked = True
+                    duration_ms = (time.monotonic() - started) * 1000.0
+                    logger.info(
+                        "event=autofocus_result method=%s success=1 duration_ms=%.0f "
+                        "lens_locked=%s preview_roi=%s sensor_roi=%s "
+                        "before_sharpness=%.1f after_sharpness=%.1f",
+                        last_method,
+                        duration_ms,
+                        int(locked),
+                        self.debug.preview_roi,
+                        self.debug.sensor_roi,
+                        last_before,
+                        last_after,
+                    )
                     return AutofocusResult(
                         success=True,
                         sharpness=last_after,
@@ -300,6 +333,8 @@ class AutofocusController:
                         improvement_ratio=last_ratio,
                         sensor_roi=last_sensor,
                         preview_size=preview_size,
+                        duration_ms=duration_ms,
+                        lens_locked=locked,
                     )
                 logger.info(
                     "event=autofocus_retry attempt=%d reason=roi_sharpness_not_improved "
@@ -309,15 +344,25 @@ class AutofocusController:
                     last_after,
                     last_ratio,
                 )
-            except AutofocusError:
+            except AutofocusError as exc:
                 self.debug.running = False
+                logger.error("event=autofocus_failure reason=%s", exc)
                 raise
             except Exception as exc:
                 self.debug.running = False
-                logger.error("Autofocus attempt %d failed: %s", attempt, exc)
+                logger.error("event=autofocus_failure attempt=%d error=%s", attempt, exc)
                 raise AutofocusError(f"Autofocus failed: {exc}") from exc
 
         self.debug.running = False
+        duration_ms = (time.monotonic() - started) * 1000.0
+        logger.error(
+            "event=autofocus_failure reason=roi_sharpness_not_improved duration_ms=%.0f "
+            "before=%.1f after=%.1f preview_roi=%s",
+            duration_ms,
+            last_before,
+            last_after,
+            _fmt_roi(last_roi),
+        )
         raise AutofocusError(
             f"Autofocus did not improve document ROI sharpness "
             f"(before={last_before:.1f} after={last_after:.1f} ratio={last_ratio:.2f}, "
@@ -333,14 +378,21 @@ class AutofocusController:
         sharpness_threshold: float,
         roi_fraction: float = 0.7,
         preview_roi: tuple[int, int, int, int] | None = None,
+        require_document_roi: bool = False,
     ) -> AutofocusResult:
         preview = await asyncio.to_thread(camera.capture_preview_array)
         if preview is None or getattr(preview, "size", 1) == 0:
             raise AutofocusError("Invalid preview frame for focus verification")
-        roi = preview_roi or self._last_preview_roi
-        if roi == (0, 0, 0, 0):
-            roi = roi_rect(preview.shape, roi_fraction)
-        roi = clip_roi(roi, preview.shape)
+        size = (int(preview.shape[1]), int(preview.shape[0]))
+        candidate = preview_roi if preview_roi is not None else self._last_preview_roi
+        if candidate is not None and candidate != (0, 0, 0, 0):
+            roi = clip_roi(candidate, preview.shape)
+            if not preview_roi_is_usable(roi, size):
+                raise AutofocusError("invalid_roi: document ROI is empty or too small")
+        elif require_document_roi:
+            raise AutofocusError("invalid_roi: document ROI required")
+        else:
+            roi = clip_roi(roi_rect(preview.shape, roi_fraction), preview.shape)
         sharpness = laplacian_variance(preview, roi=roi)
         meta = self._read_metadata(camera)
         af_state = self._af_state_from_meta(meta)
@@ -372,6 +424,11 @@ class AutofocusController:
         )
 
         if not ok:
+            logger.error(
+                "event=autofocus_failure reason=focus_verification preview_roi=%s score=%.1f",
+                _fmt_roi(roi),
+                sharpness,
+            )
             raise AutofocusError(
                 f"Focus verification failed: roi_sharpness={sharpness:.1f} "
                 f"last={last_after:.1f} min_still={sharpness_threshold:.1f} "

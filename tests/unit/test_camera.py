@@ -13,6 +13,7 @@ from idcam.camera.manager import (
     describe_preview_frame,
     map_preview_roi_to_sensor,
     normalize_picamera_preview_frame,
+    preview_roi_to_af_window,
 )
 from idcam.config.schema import CameraConfig
 from idcam.exceptions import CameraError, CameraUnavailableError
@@ -80,6 +81,23 @@ class TestPreviewToSensorMap:
         mapped = map_preview_roi_to_sensor(preview_roi, (1920, 1080), (0, 898, 9152, 5148))
         assert mapped != (1936, 1960, 5376, 3024)
         assert mapped[1] >= 898
+
+
+class TestAfWindowConversion:
+    def test_off_center_preview_roi_is_not_sensor_center(self):
+        scaler = (0, 898, 9152, 5148)
+        left = preview_roi_to_af_window((40, 200, 480, 640), (1920, 1080), scaler)
+        mid = preview_roi_to_af_window((720, 270, 480, 540), (1920, 1080), scaler)
+        assert left["sensor_roi"][0] < mid["sensor_roi"][0]
+
+    def test_mock_apply_rejects_empty_roi(self):
+        from idcam.exceptions import CameraError
+
+        mgr = CameraManager(CameraConfig(preview_width=320, preview_height=240), use_mock=True)
+        mgr.initialize()
+        with pytest.raises(CameraError, match="Invalid document AF ROI"):
+            mgr.apply_document_focus_window((0, 0, 0, 0), (320, 240))
+        mgr.shutdown()
 
 
 class FakePicamera2:
