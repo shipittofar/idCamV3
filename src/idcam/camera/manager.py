@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,8 @@ _AF_MODE_MANUAL = 0
 _AF_MODE_AUTO = 1
 _AF_MODE_CONTINUOUS = 2
 _AF_TRIGGER_START = 0
+_AF_STATE_IDLE = 0
+_AF_STATE_SCANNING = 1
 _AF_STATE_FOCUSED = 2
 _AF_STATE_FAILED = 3
 _AF_METERING_WINDOWS = 1
@@ -37,6 +40,20 @@ _AF_RANGE_FULL = 2
 
 # Preview-pixel AfWindows source must be large enough to map to a real sensor window.
 MIN_PREVIEW_AF_SIDE = 8
+# Expand the document bbox for hardware AF only (Laplacian still uses the document).
+AF_WINDOW_PAD_RATIO = 0.20
+AF_WINDOW_MIN_FRAC = 0.25
+
+
+@dataclass
+class AutofocusWaitResult:
+    """Outcome of waiting for a hardware AF cycle to finish."""
+
+    af_state: int | None
+    lens_position: float | None
+    focus_fom: float | None
+    method: str
+    timed_out: bool = False
 
 # Passed explicitly to every still encoder so the container is never inferred
 # from the output filename.
@@ -115,6 +132,32 @@ def clip_preview_roi(
     rw = max(1, min(rw, fw - x))
     rh = max(1, min(rh, fh - y))
     return x, y, rw, rh
+
+
+def expand_preview_roi(
+    roi: tuple[int, int, int, int],
+    preview_size: tuple[int, int],
+    *,
+    pad_ratio: float = AF_WINDOW_PAD_RATIO,
+    min_frac: float = AF_WINDOW_MIN_FRAC,
+) -> tuple[int, int, int, int]:
+    """Grow a document bbox around its center for AfWindows, then clip to preview.
+
+    Laplacian verification keeps the original document ROI. Hardware AF gets a
+    larger window so a texture-poor page interior is less likely to starve the
+    PDAF/CDAF metric.
+    """
+    fw, fh = int(preview_size[0]), int(preview_size[1])
+    x, y, w, h = clip_preview_roi(tuple(int(v) for v in roi), preview_size)
+    pad = max(0.0, float(pad_ratio))
+    frac = min(max(float(min_frac), 0.0), 1.0)
+    target_w = max(w + int(round(w * 2 * pad)), int(round(fw * frac)), MIN_PREVIEW_AF_SIDE)
+    target_h = max(h + int(round(h * 2 * pad)), int(round(fh * frac)), MIN_PREVIEW_AF_SIDE)
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+    nx = int(round(cx - target_w / 2.0))
+    ny = int(round(cy - target_h / 2.0))
+    return clip_preview_roi((nx, ny, int(target_w), int(target_h)), preview_size)
 
 
 def clip_xywh_to_bounds(
@@ -502,8 +545,12 @@ class CameraManager:
         with self._lock:
             fw, fh = int(preview_size[0]), int(preview_size[1])
             scaler = self._current_scaler_crop_unlocked()
+            document_roi = clip_preview_roi(tuple(int(v) for v in preview_roi), (fw, fh))
+            if not preview_roi_is_usable(preview_roi, (fw, fh)):
+                raise CameraError("Invalid document AF ROI: invalid_roi")
+            af_preview = expand_preview_roi(document_roi, (fw, fh))
             try:
-                mapped = preview_roi_to_af_window(preview_roi, (fw, fh), scaler)
+                mapped = preview_roi_to_af_window(af_preview, (fw, fh), scaler)
             except ValueError as exc:
                 raise CameraError(f"Invalid document AF ROI: {exc}") from exc
             clipped = mapped["preview_roi"]
@@ -518,8 +565,12 @@ class CameraManager:
                     }
                 )
             logger.info(
-                "event=autofocus_roi preview=%d,%d,%d,%d preview_size=%dx%d "
-                "scaler_crop=%d,%d,%d,%d sensor=%d,%d,%d,%d",
+                "event=autofocus_roi preview=%d,%d,%d,%d af_preview=%d,%d,%d,%d "
+                "preview_size=%dx%d scaler_crop=%d,%d,%d,%d sensor=%d,%d,%d,%d",
+                document_roi[0],
+                document_roi[1],
+                document_roi[2],
+                document_roi[3],
                 clipped[0],
                 clipped[1],
                 clipped[2],
@@ -530,20 +581,21 @@ class CameraManager:
                 *sensor,
             )
             return {
-                "preview_roi": clipped,
+                "preview_roi": document_roi,
+                "af_preview_roi": clipped,
                 "preview_size": (fw, fh),
                 "scaler_crop": scaler,
                 "sensor_roi": sensor,
             }
 
     def trigger_autofocus(self) -> None:
-        """Start a one-shot Auto cycle. Do not wait on AfState (often unavailable)."""
+        """Start a one-shot Auto cycle. Does not wait; callers must poll completion."""
         with self._lock:
             if self._use_mock:
                 return
             assert self._picam2 is not None
-            # Do not call picam2.autofocus_cycle(): with AfState unadvertised it
-            # often returns immediately, and a blocking wait holds the camera lock.
+            # Do not call picam2.autofocus_cycle() here: a blocking wait holds
+            # the camera lock and can stall metadata/preview updates.
             self._set_controls_unlocked(
                 {
                     "AfMode": self._af_mode_auto(),
@@ -552,15 +604,134 @@ class CameraManager:
                     "AfTrigger": self._af_trigger_start(),
                 }
             )
-            logger.info("event=autofocus_triggered method=af_controls AfMode=Auto AfTrigger=Start wait=lens_settle")
+            logger.info(
+                "event=autofocus_triggered method=af_controls AfMode=Auto AfSpeed=Fast "
+                "AfRange=Full AfTrigger=Start"
+            )
+
+    def wait_for_autofocus_completion(self, timeout_sec: float) -> AutofocusWaitResult:
+        """Wait for AfState Focused/Failed, else LensPosition settle. Never holds the camera lock across sleeps."""
+        if self._use_mock:
+            time.sleep(0.01)
+            return AutofocusWaitResult(
+                af_state=_AF_STATE_FOCUSED,
+                lens_position=1.0,
+                focus_fom=None,
+                method="af_state",
+                timed_out=False,
+            )
+        timeout = max(0.5, float(timeout_sec))
+        first = self.capture_metadata()
+        if "AfState" not in first:
+            lens = self.wait_for_lens_settle(timeout)
+            fom = first.get("FocusFoM")
+            try:
+                fom_f = float(fom) if fom is not None else None
+            except (TypeError, ValueError):
+                fom_f = None
+            return AutofocusWaitResult(
+                af_state=None,
+                lens_position=lens,
+                focus_fom=fom_f,
+                method="lens_settle",
+                timed_out=False,
+            )
+        deadline = time.monotonic() + timeout
+        last_state: int | None = None
+        last_lens: float | None = None
+        last_fom: float | None = None
+        samples = 0
+        meta = first
+        try:
+            initial_state = int(first["AfState"])
+        except (TypeError, ValueError, KeyError):
+            initial_state = None
+        started_focused = initial_state == _AF_STATE_FOCUSED
+        saw_scanning = initial_state == _AF_STATE_SCANNING
+        stale_focus_grace = time.monotonic() + 0.6
+        while time.monotonic() < deadline:
+            samples += 1
+            try:
+                last_state = int(meta["AfState"]) if "AfState" in meta else last_state
+            except (TypeError, ValueError):
+                pass
+            raw_lens = meta.get("LensPosition")
+            try:
+                last_lens = float(raw_lens) if raw_lens is not None else last_lens
+            except (TypeError, ValueError):
+                pass
+            raw_fom = meta.get("FocusFoM")
+            try:
+                last_fom = float(raw_fom) if raw_fom is not None else last_fom
+            except (TypeError, ValueError):
+                pass
+            if last_state == _AF_STATE_SCANNING:
+                saw_scanning = True
+            if samples == 1 or samples % 5 == 0:
+                logger.debug(
+                    "event=autofocus_progress sample=%d af_state=%s lens=%s focus_fom=%s",
+                    samples,
+                    last_state,
+                    last_lens,
+                    last_fom,
+                )
+            if last_state == _AF_STATE_FOCUSED:
+                # After AfTrigger, a leftover Focused from preview Continuous AF
+                # is not completion of *this* scan. Wait for Scanning, or a short
+                # grace if the lens is already on target and never leaves Focused.
+                accept_focused = saw_scanning or not started_focused or time.monotonic() >= stale_focus_grace
+                if accept_focused:
+                    logger.info(
+                        "event=autofocus_result method=af_state af_state=%s lens_position=%s focus_fom=%s",
+                        last_state,
+                        last_lens,
+                        last_fom,
+                    )
+                    return AutofocusWaitResult(
+                        af_state=last_state,
+                        lens_position=last_lens,
+                        focus_fom=last_fom,
+                        method="af_state",
+                        timed_out=False,
+                    )
+            if last_state == _AF_STATE_FAILED:
+                logger.info(
+                    "event=autofocus_result method=af_state af_state=%s lens_position=%s focus_fom=%s",
+                    last_state,
+                    last_lens,
+                    last_fom,
+                )
+                return AutofocusWaitResult(
+                    af_state=last_state,
+                    lens_position=last_lens,
+                    focus_fom=last_fom,
+                    method="af_state",
+                    timed_out=False,
+                )
+            time.sleep(0.1)
+            meta = self.capture_metadata()
+        logger.warning(
+            "event=autofocus_timeout method=af_state last_af_state=%s lens_position=%s focus_fom=%s",
+            last_state,
+            last_lens,
+            last_fom,
+        )
+        return AutofocusWaitResult(
+            af_state=last_state,
+            lens_position=last_lens,
+            focus_fom=last_fom,
+            method="timeout",
+            timed_out=True,
+        )
 
     def wait_for_lens_settle(self, timeout_sec: float) -> float | None:
-        """Wait until LensPosition stops changing. AfState is not required."""
+        """Wait until LensPosition stops changing. Used when AfState is unavailable."""
         if self._use_mock:
             time.sleep(0.05)
             return 1.0
         deadline = time.monotonic() + max(0.4, float(timeout_sec))
-        time.sleep(0.25)
+        # Hardware AF often sits Idle ~0.3–0.4s after AfTrigger before the lens moves.
+        time.sleep(0.35)
         last: float | None = None
         stable = 0
         while time.monotonic() < deadline:
@@ -586,10 +757,10 @@ class CameraManager:
         return last
 
     def autofocus_cycle(self) -> bool:
-        """Trigger AF and wait for the lens to settle (not AfState)."""
+        """Trigger AF and wait for AfState (or lens settle if AfState is absent)."""
         self.trigger_autofocus()
-        self.wait_for_lens_settle(min(float(self.config.af_timeout_sec), 3.0))
-        return True
+        result = self.wait_for_autofocus_completion(float(self.config.af_timeout_sec))
+        return not result.timed_out and result.af_state != _AF_STATE_FAILED
 
     def pause_autofocus(self) -> None:
         """Lock the current lens position so Continuous AF does not hunt during still capture."""

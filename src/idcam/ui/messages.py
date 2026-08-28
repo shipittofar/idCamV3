@@ -26,6 +26,11 @@ USER_MESSAGES: dict[AppState, str] = {
 
 FAILURE_MESSAGES = {
     "focus_failed": "Could not focus. Please remove the document and try again.",
+    "autofocus_hardware_failed": "Could not focus. Please remove the document and try again.",
+    "autofocus_timeout": "Could not focus. Please remove the document and try again.",
+    "invalid_document_roi": "Could not focus. Please remove the document and try again.",
+    "focus_verification_failed": "Could not focus. Please remove the document and try again.",
+    "still_capture_failed": "Capture failed. Please remove the document and try again.",
     "capture_failed": "Capture failed. Please remove the document and try again.",
     "upload_failed": "Unable to send document. Please remove it and try again.",
     "server_rejected": "Could not process document. Please contact support.",

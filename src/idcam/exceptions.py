@@ -30,6 +30,10 @@ class AutofocusError(CameraError):
 
     recoverable = True
 
+    def __init__(self, message: str, *, reason: str = "focus_failed") -> None:
+        super().__init__(message)
+        self.reason = reason
+
 
 class CaptureError(CameraError):
     """Image capture failed."""

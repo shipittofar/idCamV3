@@ -10,6 +10,8 @@ import pytest
 
 from idcam.camera.autofocus import AutofocusController
 from idcam.camera.manager import (
+    AutofocusWaitResult,
+    expand_preview_roi,
     map_preview_roi_to_sensor,
     parse_xywh,
     preview_roi_is_usable,
@@ -78,7 +80,7 @@ class FakeCamera:
         }
 
     def pause_autofocus(self) -> None:
-        self.pause_calls = getattr(self, "pause_calls", 0) + 1
+        self.pause_calls += 1
 
     def autofocus_cycle(self) -> Any:
         if not self.has_cycle:
@@ -89,8 +91,45 @@ class FakeCamera:
     def capture_preview_array(self) -> np.ndarray:
         return _sharp_frame()
 
-    def pause_autofocus(self) -> None:
-        self.pause_calls += 1
+
+class SequentialAfCamera(FakeCamera):
+    """Production-like trigger + AfState wait, Idle → Scanning → Focused."""
+
+    def __init__(self, *, states: list[int] | None = None) -> None:
+        super().__init__(has_cycle=False, metadata={"AfState": 0, "LensPosition": 1.0, "FocusFoM": 26})
+        self.states = states or [0, 1, 1, 2]
+        self.trigger_calls = 0
+        self.wait_calls = 0
+
+    def trigger_autofocus(self) -> None:
+        self.trigger_calls += 1
+
+    def wait_for_autofocus_completion(self, timeout_sec: float) -> AutofocusWaitResult:
+        self.wait_calls += 1
+        last = 0
+        lens = 1.0
+        fom = 26.0
+        for i, state in enumerate(self.states):
+            last = state
+            lens = 1.0 + i * 2.0
+            fom = 26.0 + i * 80.0
+            self.metadata = {"AfState": state, "LensPosition": lens, "FocusFoM": fom}
+            if state == 2:
+                return AutofocusWaitResult(2, lens, fom, "af_state", False)
+            if state == 3:
+                return AutofocusWaitResult(3, lens, fom, "af_state", False)
+        return AutofocusWaitResult(last, lens, fom, "timeout", True)
+
+
+class LensSettleCamera(FakeCamera):
+    def __init__(self) -> None:
+        super().__init__(has_cycle=False, metadata={"LensPosition": 8.0})
+
+    def trigger_autofocus(self) -> None:
+        self.trigger_calls = getattr(self, "trigger_calls", 0) + 1
+
+    def wait_for_autofocus_completion(self, timeout_sec: float) -> AutofocusWaitResult:
+        return AutofocusWaitResult(None, 8.0, None, "lens_settle", False)
 
 
 class TestAutofocusController:
@@ -178,12 +217,13 @@ class TestAutofocusController:
             def capture_preview_array(self) -> np.ndarray:
                 return np.full((80, 80, 3), 128, dtype=np.uint8)
 
-        camera = Blurry()
+        camera = Blurry(metadata={"LensPosition": 1.0})
         ctl = AutofocusController(CameraConfig(af_max_retries=2, af_timeout_sec=1.0))
         ctl.probe_capabilities(camera)
-        with pytest.raises(AutofocusError, match="did not improve"):
+        with pytest.raises(AutofocusError, match="did not complete") as raised:
             await ctl.run_autofocus(camera, sharpness_threshold=500.0)
         assert camera.cycle_calls == 2
+        assert raised.value.reason == "focus_verification_failed"
         err = None
         try:
             await ctl.run_autofocus(camera, sharpness_threshold=500.0)
@@ -247,7 +287,7 @@ class TestPreviewFocusAcceptance:
 
     @pytest.mark.asyncio
     async def test_controller_rejects_10_to_8(self):
-        camera = FakeCamera()
+        camera = FakeCamera(metadata={"LensPosition": 1.0})
         ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=2))
         ctl.probe_capabilities(camera)
         scores = iter([10.0, 8.0, 10.0, 8.0])
@@ -373,7 +413,7 @@ class TestDocumentRoiAutofocusPolicy:
             def capture_preview_array(self) -> np.ndarray:
                 return np.full((80, 80, 3), 128, dtype=np.uint8)
 
-        camera = Blurry()
+        camera = Blurry(metadata={"LensPosition": 1.0})
         ctl = AutofocusController(CameraConfig(af_max_retries=1, af_timeout_sec=1.0))
         ctl.probe_capabilities(camera)
         with pytest.raises(AutofocusError):
@@ -384,4 +424,111 @@ class TestDocumentRoiAutofocusPolicy:
 
     def test_accept_already_sharp_near_floor(self):
         assert accept_preview_focus(before=32.0, after=31.5, absolute_floor=28.0) is True
+
+
+class TestHardwareAfStateCompletion:
+    @pytest.mark.asyncio
+    async def test_idle_scanning_focused_succeeds_and_locks_lens(self):
+        camera = SequentialAfCamera()
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=3))
+        ctl.probe_capabilities(camera)
+        scores = iter([12.4, 12.0])
+        with patch("idcam.camera.autofocus.laplacian_variance", side_effect=lambda *_a, **_k: next(scores)):
+            result = await ctl.run_autofocus(camera, sharpness_threshold=48.0)
+        assert result.success is True
+        assert result.af_state == 2
+        assert result.hardware_success is True
+        assert camera.trigger_calls == 1
+        assert camera.wait_calls == 1
+        assert camera.pause_calls == 1
+        assert result.lens_locked is True
+        assert result.focus_fom_after is not None
+
+    @pytest.mark.asyncio
+    async def test_af_state_failed_does_not_retry_on_laplacian(self):
+        camera = SequentialAfCamera(states=[1, 3])
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=3))
+        ctl.probe_capabilities(camera)
+        with pytest.raises(AutofocusError) as raised:
+            await ctl.run_autofocus(camera, sharpness_threshold=1.0)
+        assert raised.value.reason == "autofocus_hardware_failed"
+        assert camera.trigger_calls == 3
+        assert camera.pause_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_af_state_timeout_is_classified(self):
+        camera = SequentialAfCamera(states=[0, 1, 1])
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
+        with pytest.raises(AutofocusError) as raised:
+            await ctl.run_autofocus(camera, sharpness_threshold=1.0)
+        assert raised.value.reason == "autofocus_timeout"
+
+    @pytest.mark.asyncio
+    async def test_lens_settle_fallback_uses_preview_sharpness(self):
+        camera = LensSettleCamera()
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
+        scores = iter([10.0, 30.0])
+        with patch("idcam.camera.autofocus.laplacian_variance", side_effect=lambda *_a, **_k: next(scores)):
+            result = await ctl.run_autofocus(camera, sharpness_threshold=48.0)
+        assert result.success is True
+        assert result.completion_method == "lens_settle"
+
+    @pytest.mark.asyncio
+    async def test_lens_settle_fallback_rejects_degraded_preview(self):
+        camera = LensSettleCamera()
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
+        scores = iter([10.0, 8.0])
+        with patch("idcam.camera.autofocus.laplacian_variance", side_effect=lambda *_a, **_k: next(scores)):
+            with pytest.raises(AutofocusError) as raised:
+                await ctl.run_autofocus(camera, sharpness_threshold=48.0)
+        assert raised.value.reason == "focus_verification_failed"
+
+
+class TestPaddedAfWindow:
+    def test_expand_keeps_document_center(self):
+        preview = (1920, 1080)
+        roi = (756, 409, 801, 482)
+        expanded = expand_preview_roi(roi, preview)
+        assert expanded[2] > roi[2]
+        assert expanded[3] > roi[3]
+        orig_cx = roi[0] + roi[2] / 2
+        new_cx = expanded[0] + expanded[2] / 2
+        assert abs(orig_cx - new_cx) < 8
+        assert expanded[0] >= 0
+        assert expanded[1] >= 0
+        assert expanded[0] + expanded[2] <= 1920
+        assert expanded[1] + expanded[3] <= 1080
+
+    def test_tiny_roi_grows_to_minimum_fraction(self):
+        expanded = expand_preview_roi((100, 100, 20, 20), (1920, 1080))
+        assert expanded[2] >= int(1920 * 0.25)
+        assert expanded[3] >= int(1080 * 0.25)
+
+    @pytest.mark.asyncio
+    async def test_verify_accepts_focused_with_small_laplacian_noise(self):
+        camera = FakeCamera()
+        ctl = AutofocusController(CameraConfig())
+        ctl.probe_capabilities(camera)
+        ctl.debug.focus_before = 12.4
+        ctl.debug.focus_after = 12.0
+        ctl._last_preview_roi = (20, 20, 80, 60)
+        with patch("idcam.camera.autofocus.laplacian_variance", return_value=12.1):
+            result = await ctl.verify_focus(camera, sharpness_threshold=48.0)
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_verify_rejects_collapsed_sharpness_even_if_focused(self):
+        camera = FakeCamera()
+        ctl = AutofocusController(CameraConfig())
+        ctl.probe_capabilities(camera)
+        ctl.debug.focus_before = 40.0
+        ctl.debug.focus_after = 40.0
+        ctl._last_preview_roi = (20, 20, 80, 60)
+        with patch("idcam.camera.autofocus.laplacian_variance", return_value=5.0):
+            with pytest.raises(AutofocusError) as raised:
+                await ctl.verify_focus(camera, sharpness_threshold=48.0)
+        assert raised.value.reason == "focus_verification_failed"
 

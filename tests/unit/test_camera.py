@@ -73,6 +73,8 @@ class TestMockCamera:
         assert mapping["preview_roi"] == (288, 162, 1344, 756)
         assert mapping["preview_size"] == (1920, 1080)
         assert mapping["sensor_roi"][2] > 0
+        assert mapping["af_preview_roi"][2] >= mapping["preview_roi"][2]
+        assert mapping["af_preview_roi"][3] >= mapping["preview_roi"][3]
         mgr.shutdown()
 
 

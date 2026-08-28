@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from idcam.camera.manager import preview_roi_is_usable
+from idcam.camera.manager import AutofocusWaitResult, preview_roi_is_usable
 from idcam.config.schema import CameraConfig
 from idcam.exceptions import AutofocusError
 from idcam.logging.setup import get_logger
@@ -92,6 +92,11 @@ class AutofocusResult:
     preview_size: tuple[int, int] = (0, 0)
     duration_ms: float = 0.0
     lens_locked: bool = False
+    focus_fom_before: float | None = None
+    focus_fom_after: float | None = None
+    completion_method: str = ""
+    hardware_success: bool = False
+    verification_status: str = ""
 
 
 @dataclass
@@ -176,12 +181,18 @@ class AutofocusController:
             clipped = clip_roi(preview_roi, frame.shape)
             if require_document_roi:
                 if not preview_roi_is_usable(clipped, size):
-                    raise AutofocusError("invalid_roi: document ROI is empty or too small")
+                    raise AutofocusError(
+                        "invalid_roi: document ROI is empty or too small",
+                        reason="invalid_document_roi",
+                    )
             elif clipped[2] < 1 or clipped[3] < 1:
-                raise AutofocusError("invalid_roi: document ROI is empty or too small")
+                raise AutofocusError(
+                    "invalid_roi: document ROI is empty or too small",
+                    reason="invalid_document_roi",
+                )
             return clipped
         if require_document_roi:
-            raise AutofocusError("invalid_roi: document ROI required")
+            raise AutofocusError("invalid_roi: document ROI required", reason="invalid_document_roi")
         return clip_roi(self._center_roi(frame.shape, roi_fraction), frame.shape)
 
     async def run_autofocus(
@@ -202,6 +213,10 @@ class AutofocusController:
         last_lens_after: Any = None
         last_ratio = 0.0
         last_method = "none"
+        last_fom_before: float | None = None
+        last_fom_after: float | None = None
+        last_completion = ""
+        last_fail_reason = "focus_failed"
         preview_size = (0, 0)
         started = time.monotonic()
         # Absolute still-image floor must not veto a real preview improvement.
@@ -224,6 +239,7 @@ class AutofocusController:
                 meta_before = self._read_metadata(camera)
                 last_lens_before = meta_before.get("LensPosition")
                 last_af_state = self._af_state_from_meta(meta_before)
+                last_fom_before = self._meta_float(meta_before, "FocusFoM")
 
                 self.debug.focus_before = last_before
                 self.debug.lens_before = float(last_lens_before) if last_lens_before is not None else None
@@ -238,7 +254,7 @@ class AutofocusController:
                 logger.info(
                     "event=autofocus_start attempt=%d/%d preview_roi=%s sensor_roi=%s "
                     "preview_size=%dx%d scaler_crop=%s before_sharpness=%.1f "
-                    "preview_floor=%.1f still_threshold=%.1f lens=%s "
+                    "preview_floor=%.1f still_threshold=%.1f lens=%s focus_fom=%s "
                     "degraded=%s af_state_advertised=%s",
                     attempt,
                     self.config.af_max_retries,
@@ -251,11 +267,12 @@ class AutofocusController:
                     preview_floor,
                     sharpness_threshold,
                     last_lens_before,
+                    last_fom_before,
                     self.capabilities.degraded,
                     self.capabilities.af_state,
                 )
 
-                last_method, last_af_state = await self._run_hardware_af(camera, attempt)
+                last_method, wait_info = await self._run_hardware_af(camera, attempt)
                 self.debug.method = last_method
 
                 after_frame = await asyncio.to_thread(camera.capture_preview_array)
@@ -264,28 +281,44 @@ class AutofocusController:
                 last_after = laplacian_variance(after_frame, roi=last_roi)
                 meta_after = self._read_metadata(camera)
                 last_lens_after = meta_after.get("LensPosition")
+                last_fom_after = self._meta_float(meta_after, "FocusFoM")
                 measured_state = self._af_state_from_meta(meta_after)
-                if last_af_state is None:
-                    last_af_state = measured_state
+                wait_state = wait_info.af_state if wait_info is not None else None
+                last_af_state = wait_state if wait_state is not None else measured_state
+                if last_fom_after is None and wait_info is not None:
+                    last_fom_after = wait_info.focus_fom
 
                 last_ratio = (last_after / last_before) if last_before > 1e-6 else (2.0 if last_after > 0 else 0.0)
                 improved = last_after > last_before
-                accepted = accept_preview_focus(
+                laplacian_ok = accept_preview_focus(
                     before=last_before,
                     after=last_after,
                     absolute_floor=preview_floor,
+                )
+                hardware_ok, last_completion, last_fail_reason = self._classify_hardware_result(
+                    af_state=last_af_state,
+                    wait_info=wait_info,
+                    laplacian_ok=laplacian_ok,
                 )
                 self.debug.focus_after = last_after
                 self.debug.lens_after = float(last_lens_after) if last_lens_after is not None else None
                 self.debug.improvement_ratio = round(last_ratio, 3)
                 self.debug.running = False
+                verification_log = (
+                    "skipped"
+                    if last_af_state == AF_STATE_FOCUSED
+                    else ("ok" if laplacian_ok else "failed")
+                )
                 logger.info(
-                    "event=autofocus_result method=%s success=%s "
+                    "event=autofocus_result method=%s hardware_success=%s verification=%s "
                     "before_sharpness=%.1f after_sharpness=%.1f ratio=%.3f improved=%s "
                     "preview_floor=%.1f still_threshold=%.1f attempt=%d "
-                    "lens_before=%s lens_after=%s af_state=%s preview_roi=%s sensor_roi=%s",
+                    "lens_before=%s lens_after=%s af_state=%s "
+                    "focus_fom_before=%s focus_fom_after=%s "
+                    "preview_roi=%s sensor_roi=%s completion=%s",
                     last_method,
-                    accepted,
+                    hardware_ok,
+                    verification_log,
                     last_before,
                     last_after,
                     last_ratio,
@@ -296,20 +329,29 @@ class AutofocusController:
                     last_lens_before,
                     last_lens_after,
                     last_af_state,
+                    last_fom_before,
+                    last_fom_after,
                     self.debug.preview_roi,
                     self.debug.sensor_roi,
+                    last_completion,
                 )
-                if accepted:
+                if hardware_ok:
                     pause = getattr(camera, "pause_autofocus", None)
                     locked = False
                     if callable(pause):
                         await asyncio.to_thread(pause)
                         locked = True
                     duration_ms = (time.monotonic() - started) * 1000.0
+                    verification_status = (
+                        "af_state_focused"
+                        if last_af_state == AF_STATE_FOCUSED
+                        else ("preview_sharpness_ok" if laplacian_ok else last_completion)
+                    )
                     logger.info(
                         "event=autofocus_result method=%s success=1 duration_ms=%.0f "
                         "lens_locked=%s preview_roi=%s sensor_roi=%s "
-                        "before_sharpness=%.1f after_sharpness=%.1f",
+                        "before_sharpness=%.1f after_sharpness=%.1f "
+                        "af_state=%s focus_fom_before=%s focus_fom_after=%s verification=%s",
                         last_method,
                         duration_ms,
                         int(locked),
@@ -317,6 +359,10 @@ class AutofocusController:
                         self.debug.sensor_roi,
                         last_before,
                         last_after,
+                        last_af_state,
+                        last_fom_before,
+                        last_fom_after,
+                        verification_status,
                     )
                     return AutofocusResult(
                         success=True,
@@ -335,18 +381,25 @@ class AutofocusController:
                         preview_size=preview_size,
                         duration_ms=duration_ms,
                         lens_locked=locked,
+                        focus_fom_before=last_fom_before,
+                        focus_fom_after=last_fom_after,
+                        completion_method=last_completion,
+                        hardware_success=True,
+                        verification_status=verification_status,
                     )
                 logger.info(
-                    "event=autofocus_retry attempt=%d reason=roi_sharpness_not_improved "
-                    "before=%.1f after=%.1f ratio=%.3f",
+                    "event=autofocus_retry attempt=%d reason=%s "
+                    "before=%.1f after=%.1f ratio=%.3f af_state=%s",
                     attempt,
+                    last_fail_reason,
                     last_before,
                     last_after,
                     last_ratio,
+                    last_af_state,
                 )
             except AutofocusError as exc:
                 self.debug.running = False
-                logger.error("event=autofocus_failure reason=%s", exc)
+                logger.error("event=autofocus_failure reason=%s", getattr(exc, "reason", exc))
                 raise
             except Exception as exc:
                 self.debug.running = False
@@ -356,19 +409,22 @@ class AutofocusController:
         self.debug.running = False
         duration_ms = (time.monotonic() - started) * 1000.0
         logger.error(
-            "event=autofocus_failure reason=roi_sharpness_not_improved duration_ms=%.0f "
-            "before=%.1f after=%.1f preview_roi=%s",
+            "event=autofocus_failure reason=%s duration_ms=%.0f "
+            "before=%.1f after=%.1f preview_roi=%s af_state=%s",
+            last_fail_reason,
             duration_ms,
             last_before,
             last_after,
             _fmt_roi(last_roi),
+            last_af_state,
         )
         raise AutofocusError(
-            f"Autofocus did not improve document ROI sharpness "
+            f"Autofocus did not complete "
             f"(before={last_before:.1f} after={last_after:.1f} ratio={last_ratio:.2f}, "
             f"attempts={self.config.af_max_retries} method={last_method} "
             f"preview_roi={_fmt_roi(last_roi)} sensor_roi={_fmt_roi(last_sensor)} "
-            f"lens={last_lens_before}->{last_lens_after})"
+            f"lens={last_lens_before}->{last_lens_after} af_state={last_af_state})",
+            reason=last_fail_reason,
         )
 
     async def verify_focus(
@@ -388,9 +444,12 @@ class AutofocusController:
         if candidate is not None and candidate != (0, 0, 0, 0):
             roi = clip_roi(candidate, preview.shape)
             if not preview_roi_is_usable(roi, size):
-                raise AutofocusError("invalid_roi: document ROI is empty or too small")
+                raise AutofocusError(
+                    "invalid_roi: document ROI is empty or too small",
+                    reason="invalid_document_roi",
+                )
         elif require_document_roi:
-            raise AutofocusError("invalid_roi: document ROI required")
+            raise AutofocusError("invalid_roi: document ROI required", reason="invalid_document_roi")
         else:
             roi = clip_roi(roi_rect(preview.shape, roi_fraction), preview.shape)
         sharpness = laplacian_variance(preview, roi=roi)
@@ -405,11 +464,17 @@ class AutofocusController:
             after=sharpness,
             absolute_floor=preview_floor,
         )
-        ok = held or relative or sharpness >= float(sharpness_threshold)
+        collapsed = last_after > 0 and sharpness < last_after * 0.4
+        if af_state == AF_STATE_FAILED:
+            ok = False
+        elif af_state == AF_STATE_FOCUSED:
+            ok = not collapsed
+        else:
+            ok = held or relative or sharpness >= float(sharpness_threshold)
 
         logger.info(
             "event=focus_verification score=%.1f last_after=%.1f min_still=%.1f "
-            "preview_floor=%.1f held=%s relative=%s ok=%s af_state=%s "
+            "preview_floor=%.1f held=%s relative=%s collapsed=%s ok=%s af_state=%s "
             "lens_position=%s preview_roi=%s",
             sharpness,
             last_after,
@@ -417,6 +482,7 @@ class AutofocusController:
             preview_floor,
             held,
             relative,
+            collapsed,
             ok,
             af_state,
             meta.get("LensPosition"),
@@ -425,14 +491,15 @@ class AutofocusController:
 
         if not ok:
             logger.error(
-                "event=autofocus_failure reason=focus_verification preview_roi=%s score=%.1f",
+                "event=autofocus_failure reason=focus_verification_failed preview_roi=%s score=%.1f",
                 _fmt_roi(roi),
                 sharpness,
             )
             raise AutofocusError(
                 f"Focus verification failed: roi_sharpness={sharpness:.1f} "
                 f"last={last_after:.1f} min_still={sharpness_threshold:.1f} "
-                f"preview_roi={_fmt_roi(roi)}"
+                f"preview_roi={_fmt_roi(roi)} af_state={af_state}",
+                reason="focus_verification_failed",
             )
 
         self.debug.focus_after = sharpness
@@ -504,16 +571,62 @@ class AutofocusController:
         except (TypeError, ValueError):
             return None
 
-    async def _run_hardware_af(self, camera: FocusCapableCamera, attempt: int) -> tuple[str, int | None]:
-        """Trigger a real AF scan. Do not wait on AfState (often unadvertised)."""
+    def _meta_float(self, meta: dict[str, Any], key: str) -> float | None:
+        if key not in meta:
+            return None
+        try:
+            return float(meta[key])
+        except (TypeError, ValueError):
+            return None
+
+    def _classify_hardware_result(
+        self,
+        *,
+        af_state: int | None,
+        wait_info: AutofocusWaitResult | None,
+        laplacian_ok: bool,
+    ) -> tuple[bool, str, str]:
+        """Return (hardware_ok, completion_method, fail_reason)."""
+        if wait_info is not None and wait_info.timed_out:
+            return False, "timeout", "autofocus_timeout"
+        if af_state == AF_STATE_FAILED:
+            return False, "af_state_failed", "autofocus_hardware_failed"
+        if af_state == AF_STATE_FOCUSED:
+            return True, "af_state_focused", "focus_failed"
+        if wait_info is not None and wait_info.method == "lens_settle":
+            if laplacian_ok:
+                return True, "lens_settle", "focus_failed"
+            return False, "lens_settle", "focus_verification_failed"
+        if laplacian_ok:
+            return True, "preview_sharpness", "focus_failed"
+        return False, "preview_sharpness", "focus_verification_failed"
+
+    async def _run_hardware_af(
+        self, camera: FocusCapableCamera, attempt: int
+    ) -> tuple[str, AutofocusWaitResult | None]:
+        """Trigger a real AF scan and wait for AfState or lens settle."""
         trigger = getattr(camera, "trigger_autofocus", None)
+        wait_done = getattr(camera, "wait_for_autofocus_completion", None)
         settle = getattr(camera, "wait_for_lens_settle", None)
+        if callable(trigger) and callable(wait_done):
+            logger.info("event=autofocus_triggered method=af_trigger_wait_completion attempt=%d", attempt)
+            await asyncio.to_thread(trigger)
+            info = await asyncio.to_thread(wait_done, float(self.config.af_timeout_sec))
+            method = "hardware_trigger" if self.capabilities.hardware_af_available else "sharpness_only"
+            return method, info if isinstance(info, AutofocusWaitResult) else None
+
         if callable(trigger) and callable(settle):
             logger.info("event=autofocus_triggered method=af_trigger_lens_settle attempt=%d", attempt)
             await asyncio.to_thread(trigger)
-            await asyncio.to_thread(settle, min(float(self.config.af_timeout_sec), 3.0))
+            await asyncio.to_thread(settle, float(self.config.af_timeout_sec))
             method = "hardware_trigger" if self.capabilities.hardware_af_available else "sharpness_only"
-            return method, None
+            return method, AutofocusWaitResult(
+                af_state=None,
+                lens_position=None,
+                focus_fom=None,
+                method="lens_settle",
+                timed_out=False,
+            )
 
         if self.capabilities.autofocus_cycle:
             logger.info("event=autofocus_triggered method=autofocus_cycle attempt=%d", attempt)
@@ -528,11 +641,24 @@ class AutofocusController:
                     attempt,
                     self.config.af_timeout_sec,
                 )
-                return "hardware_cycle", None
+                return "hardware_cycle", AutofocusWaitResult(
+                    af_state=None,
+                    lens_position=None,
+                    focus_fom=None,
+                    method="timeout",
+                    timed_out=True,
+                )
             if cycle_ok is False:
                 logger.warning(
                     "event=autofocus_result success=false method=autofocus_cycle attempt=%d",
                     attempt,
+                )
+                return "hardware_cycle", AutofocusWaitResult(
+                    af_state=AF_STATE_FAILED,
+                    lens_position=None,
+                    focus_fom=None,
+                    method="af_state",
+                    timed_out=False,
                 )
             method = "hardware_cycle" if self.capabilities.hardware_af_available else "sharpness_only"
             return method, None
@@ -544,7 +670,13 @@ class AutofocusController:
             )
             await self._trigger_af(camera)
             state = await self._wait_for_af(camera)
-            return "hardware_controls", state
+            return "hardware_controls", AutofocusWaitResult(
+                af_state=state,
+                lens_position=None,
+                focus_fom=None,
+                method="af_state" if state is not None else "lens_settle",
+                timed_out=False,
+            )
 
         logger.warning("event=autofocus_triggered method=sharpness_only attempt=%d", attempt)
         return "sharpness_only", None
@@ -559,7 +691,7 @@ class AutofocusController:
         """Wait on LensPosition settle, or AfState only if the camera actually exposes it."""
         settle = getattr(camera, "wait_for_lens_settle", None)
         if callable(settle):
-            await asyncio.to_thread(settle, min(float(self.config.af_timeout_sec), 3.0))
+            await asyncio.to_thread(settle, float(self.config.af_timeout_sec))
             return None
 
         deadline = time.monotonic() + self.config.af_timeout_sec

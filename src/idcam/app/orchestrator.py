@@ -60,6 +60,24 @@ ONE_SHOT_STATES = frozenset({
     AppState.SUCCESS,
 })
 
+_AUTOFOCUS_FAILURE_KEYS = frozenset(
+    {
+        "autofocus_hardware_failed",
+        "autofocus_timeout",
+        "invalid_document_roi",
+        "focus_verification_failed",
+        "focus_failed",
+    }
+)
+
+
+def _autofocus_failure_key(exc: AutofocusError | str) -> str:
+    if isinstance(exc, AutofocusError):
+        reason = getattr(exc, "reason", "focus_failed")
+    else:
+        reason = exc
+    return reason if reason in _AUTOFOCUS_FAILURE_KEYS else "focus_failed"
+
 
 class ApplicationOrchestrator:
     """
@@ -679,8 +697,8 @@ class ApplicationOrchestrator:
         preview_roi = self._accepted_preview_roi(frame, allow_search_fallback=not auto)
         require_document_roi = auto or self._accepted_geometry is not None
         if require_document_roi and preview_roi is None:
-            logger.error("event=autofocus_failure reason=invalid_roi capture_id=%s", self._transaction.capture_id)
-            await self._fail_transaction_and_wait("focus_failed", "invalid_roi: no accepted document geometry")
+            logger.error("event=autofocus_failure reason=invalid_document_roi capture_id=%s", self._transaction.capture_id)
+            await self._fail_transaction_and_wait("invalid_document_roi", "invalid_roi: no accepted document geometry")
             return
         self._publish_debug(frame)
         self._transaction.mark_focus_started()
@@ -739,11 +757,12 @@ class ApplicationOrchestrator:
             self._transition(AppState.FOCUS_VERIFICATION, reason="autofocus_accepted")
         except AutofocusError as exc:
             logger.error(
-                "event=autofocus_result capture_id=%s success=0 error=%s",
+                "event=autofocus_result capture_id=%s success=0 reason=%s error=%s",
                 self._transaction.capture_id,
+                getattr(exc, "reason", "focus_failed"),
                 exc,
             )
-            await self._fail_transaction_and_wait("focus_failed", str(exc))
+            await self._fail_transaction_and_wait(_autofocus_failure_key(exc), str(exc))
 
     async def _focus_verification_tick(self) -> None:
         if not self._claim_state_action():
@@ -756,7 +775,7 @@ class ApplicationOrchestrator:
         )
         require_document_roi = self._transaction.trigger == "auto" or self._accepted_geometry is not None
         if require_document_roi and preview_roi is None:
-            await self._fail_transaction_and_wait("focus_failed", "invalid_roi: no accepted document geometry")
+            await self._fail_transaction_and_wait("invalid_document_roi", "invalid_roi: no accepted document geometry")
             return
         try:
             result = await self.autofocus.verify_focus(
@@ -769,11 +788,14 @@ class ApplicationOrchestrator:
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
             self._transition(AppState.CAPTURING, reason="focus_verified")
-        except AutofocusError:
+        except AutofocusError as exc:
             if self._transaction.focus_verify_attempts < self.config.camera.af_verify_max_retries:
                 self._transition(AppState.FOCUSING, reason="refocus")
             else:
-                await self._fail_transaction_and_wait("focus_failed", "Focus verification failed")
+                await self._fail_transaction_and_wait(
+                    _autofocus_failure_key(exc),
+                    str(exc) or "Focus verification failed",
+                )
 
     async def _capturing_tick(self) -> None:
         if not self._claim_state_action():
@@ -803,7 +825,7 @@ class ApplicationOrchestrator:
         self._capture_started = True
         self._set_manual_phase("capturing", "Capturing...")
         logger.info(
-            "event=capture_start capture_id=%s path=%s accepted_bbox=%s",
+            "event=capture_start event_alias=still_capture_start capture_id=%s path=%s accepted_bbox=%s",
             self._transaction.capture_id,
             output_path,
             None if self._accepted_geometry is None else self._accepted_geometry.bbox,
@@ -824,7 +846,7 @@ class ApplicationOrchestrator:
         except CaptureError as exc:
             self._last_capture_duration_ms = (time.monotonic() - started) * 1000.0
             logger.error(
-                "event=capture_result capture_id=%s success=0 reason=%s duration_ms=%.0f",
+                "event=capture_result event_alias=still_capture_failed capture_id=%s success=0 reason=%s duration_ms=%.0f",
                 self._transaction.capture_id,
                 exc,
                 self._last_capture_duration_ms,
@@ -849,7 +871,7 @@ class ApplicationOrchestrator:
                 sharpness=result.sharpness,
             )
             logger.info(
-                "event=capture_result capture_id=%s success=1 path=%s width=%d height=%d "
+                "event=capture_result event_alias=capture_validation capture_id=%s success=1 path=%s width=%d height=%d "
                 "size_bytes=%d duration_ms=%.0f validation=ok sharpness=%.1f",
                 self._transaction.capture_id,
                 self._capture_path,
@@ -886,7 +908,7 @@ class ApplicationOrchestrator:
         self._upload_result = "started"
         self._set_manual_phase("uploading", "Uploading...")
         logger.info(
-            "event=pipeline_stage stage=uploading capture_id=%s path=%s",
+            "event=pipeline_stage stage=uploading event_alias=api_upload_start capture_id=%s path=%s",
             self._transaction.capture_id,
             self._capture_path,
         )
@@ -900,16 +922,23 @@ class ApplicationOrchestrator:
             self._pending_response = await self.api.upload_document(request)
             self._transaction.mark_upload_completed(self._pending_response.http_status)
             self._upload_result = f"http_{self._pending_response.http_status}"
+            logger.info(
+                "event=api_upload_result capture_id=%s success=1 http_status=%s",
+                self._transaction.capture_id,
+                self._pending_response.http_status,
+            )
             self.sm.touch_progress()
             self._transition(AppState.WAITING_FOR_SERVER, reason="upload_sent")
         except (ServerRejectedError, ServerError, ProtocolError) as exc:
             self.temp_store.cleanup(self._capture_path)
             key = "server_rejected" if isinstance(exc, ServerRejectedError) else "upload_failed"
             self._upload_result = key
+            logger.error("event=api_upload_result capture_id=%s success=0 reason=%s", self._transaction.capture_id, key)
             await self._fail_transaction_and_wait(key, str(exc))
         except NetworkError as exc:
             self.temp_store.cleanup(self._capture_path)
             self._upload_result = "upload_failed"
+            logger.error("event=api_upload_result capture_id=%s success=0 reason=upload_failed", self._transaction.capture_id)
             await self._fail_transaction_and_wait("upload_failed", str(exc))
 
     async def _waiting_server_tick(self) -> None:
