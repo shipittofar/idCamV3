@@ -14,6 +14,7 @@ from idcam.camera.autofocus import AutofocusResult
 from idcam.config.schema import AppConfig, CameraConfig, DetectionConfig, QualityConfig, ServerConfig, UIConfig
 from idcam.network.protocol import ServerResponse, UploadOutcome
 from idcam.system.component_health import ComponentStatus, HealthLevel
+from idcam.vision.document_detector import DocumentDetector
 
 
 @pytest.fixture
@@ -34,6 +35,8 @@ def app_config(tmp_path):
             edge_density_threshold=0.01,
             stable_frames_required=2,
             removal_frames_required=2,
+            geometry_stable_frames_required=2,
+            geometry_stability_threshold_px=12.0,
         ),
         camera=CameraConfig(preview_fps=30.0, af_timeout_sec=1.0, af_max_retries=1),
         ui=UIConfig(
@@ -51,17 +54,36 @@ def _orch(app_config):
 
 
 def _empty_frame():
-    return np.full((120, 160, 3), 200, dtype=np.uint8)
+    return _wood_table((480, 640))
 
 
-def _document_frame():
-    frame = _empty_frame()
-    frame[20:100, 20:140] = 40
-    frame[20:28, 20:140] = 0
-    frame[92:100, 20:140] = 0
-    frame[20:100, 20:28] = 0
-    frame[20:100, 132:140] = 0
-    return frame
+def _wood_table(shape: tuple[int, int], *, brightness: int = 0) -> np.ndarray:
+    h, w = shape
+    yy, xx = np.indices((h, w))
+    base = (85 + (xx * 3 + yy * 5) % 45).astype(np.int16) + brightness
+    base = np.clip(base, 0, 255).astype(np.uint8)
+    g = (base.astype(np.int16) * 70 // 100).clip(0, 255).astype(np.uint8)
+    b = (base.astype(np.int16) * 48 // 100).clip(0, 255).astype(np.uint8)
+    return np.stack([base, g, b], axis=-1)
+
+
+def _document_frame(*, box: tuple[int, int, int, int] = (80, 60, 480, 360)) -> np.ndarray:
+    x, y, pw, ph = box
+    img = _wood_table((480, 640))
+    img[y : y + ph, x : x + pw] = (242, 238, 230)
+    img[y : y + 3, x : x + pw] = 35
+    img[y + ph - 3 : y + ph, x : x + pw] = 35
+    img[y : y + ph, x : x + 3] = 35
+    img[y : y + ph, x + pw - 3 : x + pw] = 35
+    return img
+
+
+async def _idle_until_auto_detected(orch, *, ticks: int = 12) -> None:
+    for _ in range(ticks):
+        await orch._idle_tick()
+        if orch.sm.state == AppState.DOCUMENT_DETECTED:
+            return
+    raise AssertionError(f"auto transaction did not start; state={orch.sm.state}")
 
 
 class TestStartupGoesIdle:
@@ -84,9 +106,8 @@ class TestAutoCapturePath:
     async def test_idle_document_starts_detected(self, app_config):
         orch = _orch(app_config)
         orch.sm.state = AppState.IDLE
-        orch.detector.update_baseline(_empty_frame())
         orch._safe_preview = AsyncMock(return_value=_document_frame())
-        await orch._idle_tick()
+        await _idle_until_auto_detected(orch)
         assert orch.sm.state == AppState.DOCUMENT_DETECTED
         assert orch._transaction is not None
         assert orch._transaction.trigger == "auto"
@@ -104,10 +125,8 @@ class TestAutoCapturePath:
         orch = _orch(app_config)
         orch.sm.state = AppState.WAITING_FOR_STABILITY
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
-        orch.detector.update_baseline(_empty_frame())
-        frame = _document_frame()
-        orch._safe_preview = AsyncMock(return_value=frame)
-        for _ in range(6):
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        for _ in range(8):
             await orch._stability_tick()
             if orch.sm.state == AppState.FOCUSING:
                 break
@@ -164,17 +183,16 @@ class TestAutoCapturePath:
 
 class TestIdleDoesNotStayWhenReady:
     @pytest.mark.asyncio
-    async def test_awaiting_clear_scene_retries_when_document_still_present(self, app_config):
+    async def test_awaiting_clear_scene_does_not_retry_same_document(self, app_config):
         orch = _orch(app_config)
         orch.sm.state = AppState.IDLE
         orch._awaiting_clear_scene = True
-        orch.detector.update_baseline(_empty_frame())
         orch._safe_preview = AsyncMock(return_value=_document_frame())
-        await orch._idle_tick()
-        assert orch.sm.state == AppState.DOCUMENT_DETECTED
-        assert orch._awaiting_clear_scene is False
-        assert orch._transaction is not None
-        assert orch._transaction.trigger == "auto"
+        for _ in range(6):
+            await orch._idle_tick()
+        assert orch.sm.state == AppState.IDLE
+        assert orch._awaiting_clear_scene is True
+        assert orch._transaction is None
 
 
 class TestAutoDetectStableFocusCapture:
@@ -182,7 +200,6 @@ class TestAutoDetectStableFocusCapture:
     async def test_detect_stable_focus_capture(self, app_config):
         orch = _orch(app_config)
         orch.sm.state = AppState.IDLE
-        orch.detector.update_baseline(_empty_frame())
         orch._safe_preview = AsyncMock(return_value=_document_frame())
         orch.autofocus.run_autofocus = AsyncMock(
             return_value=AutofocusResult(True, 35.0, 1, None, "hardware_trigger", 28.0, 10.0, True)
@@ -196,7 +213,7 @@ class TestAutoDetectStableFocusCapture:
             return path
 
         orch.capture_service.capture = fake_capture
-        await orch._idle_tick()
+        await _idle_until_auto_detected(orch)
         assert orch.sm.state == AppState.DOCUMENT_DETECTED
         await orch._document_detected_tick()
         assert orch.sm.state == AppState.WAITING_FOR_STABILITY
@@ -220,7 +237,6 @@ class TestRemovalHold:
         orch.sm.state = AppState.WAITING_FOR_REMOVAL
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
         orch._transaction.mark_completed()
-        orch.detector.update_baseline(_empty_frame())
         orch._safe_preview = AsyncMock(return_value=_document_frame())
         await orch._removal_tick()
         await orch._removal_tick()
@@ -235,7 +251,6 @@ class TestRemovalHold:
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
         orch._transaction.mark_completed()
         empty = _empty_frame()
-        orch.detector.update_baseline(empty)
         orch._safe_preview = AsyncMock(return_value=empty)
         await orch._removal_tick()
         await orch._removal_tick()
@@ -314,4 +329,174 @@ class TestPreviewTickObservability:
         assert orch._last_tick_ms == pytest.approx(40.0, abs=0.1)
         assert orch._last_detect_hz > 0
         assert orch._preview_tick_count == 2
+
+
+class TestPhase2CGeometryPolicy:
+    @pytest.mark.asyncio
+    async def test_boot_with_page_geometry_present_without_baseline(self, app_config):
+        orch = _orch(app_config)
+        page = _document_frame()
+        geom = orch.detector.detect_geometry(page)
+        assert geom.present is True
+        assert orch.detector._baseline is None
+        orch.sm.state = AppState.IDLE
+        orch._safe_preview = AsyncMock(return_value=page)
+        await orch._idle_tick()
+        assert orch.detector.last_geometry().present is True
+        assert orch._transaction is None
+        assert orch.sm.state == AppState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_one_geometry_frame_does_not_start_transaction(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        await orch._idle_tick()
+        assert orch.sm.state == AppState.IDLE
+        assert orch._transaction is None
+
+    @pytest.mark.asyncio
+    async def test_stable_geometry_eventually_arms(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        await _idle_until_auto_detected(orch)
+        assert orch.geometry_stability.stable_count >= app_config.detection.geometry_stable_frames_required
+        assert orch._transaction.trigger == "auto"
+
+    @pytest.mark.asyncio
+    async def test_moving_document_does_not_become_stable(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        boxes = [(40, 40, 480, 360), (90, 50, 480, 360), (140, 70, 480, 360), (190, 90, 400, 300)]
+        frames = [_document_frame(box=b) for b in boxes]
+        idx = {"i": 0}
+
+        async def next_frame():
+            frame = frames[idx["i"] % len(frames)]
+            idx["i"] += 1
+            return frame
+
+        orch._safe_preview = AsyncMock(side_effect=next_frame)
+        for _ in range(8):
+            await orch._idle_tick()
+        assert orch.sm.state == AppState.IDLE
+        assert orch._transaction is None
+        assert orch.geometry_stability.stable_count < app_config.detection.geometry_stable_frames_required
+
+    @pytest.mark.asyncio
+    async def test_lighting_change_on_empty_scene_is_not_a_document(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        frames = [_wood_table((480, 640), brightness=d) for d in (0, 25, 50, 80)]
+        idx = {"i": 0}
+
+        async def next_frame():
+            frame = frames[min(idx["i"], len(frames) - 1)]
+            idx["i"] += 1
+            return frame
+
+        orch._safe_preview = AsyncMock(side_effect=next_frame)
+        for _ in range(6):
+            await orch._idle_tick()
+        assert orch.sm.state == AppState.IDLE
+        assert orch._transaction is None
+        assert orch.detector.last_geometry().present is False
+
+        orch.sm.state = AppState.WAITING_FOR_REMOVAL
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
+        orch._transaction.mark_completed()
+        orch._removal_count = 0
+        bright = _wood_table((480, 640), brightness=80)
+        orch._safe_preview = AsyncMock(return_value=bright)
+        await orch._removal_tick()
+        await orch._removal_tick()
+        assert orch.sm.state == AppState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_geometry_absence_removes_document(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.WAITING_FOR_REMOVAL
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
+        orch._transaction.mark_completed()
+        orch._safe_preview = AsyncMock(return_value=_empty_frame())
+        await orch._removal_tick()
+        assert orch.sm.state == AppState.WAITING_FOR_REMOVAL
+        await orch._removal_tick()
+        assert orch.sm.state == AppState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_failed_auto_capture_does_not_retry_same_document(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.FOCUSING
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-fail")
+        await orch._fail_transaction_and_wait("focus_failed", "soft")
+        assert orch._awaiting_clear_scene is True
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        for _ in range(8):
+            await orch._idle_tick()
+        assert orch.sm.state == AppState.IDLE
+        assert orch._transaction is None
+        assert orch._awaiting_clear_scene is True
+
+        orch._safe_preview = AsyncMock(return_value=_empty_frame())
+        for _ in range(12):
+            await orch._idle_tick()
+            if orch._awaiting_clear_scene is False:
+                break
+        assert orch._awaiting_clear_scene is False
+
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        await _idle_until_auto_detected(orch)
+        assert orch._transaction.capture_id != "cap-fail"
+
+    @pytest.mark.asyncio
+    async def test_capture_time_check_does_not_mutate_baseline(self, app_config):
+        orch = _orch(app_config)
+        page = _document_frame()
+        geom = orch.detector.detect_geometry(page)
+        orch.geometry_stability.update(geom)
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch.sm.state = AppState.CAPTURING
+        orch._safe_preview = AsyncMock(return_value=page)
+        with patch("idcam.vision.document_detector.cv2.accumulateWeighted") as acc, patch.object(
+            orch.detector, "classify", wraps=orch.detector.classify
+        ) as classify:
+            ok = await orch._check_motion_abort()
+        assert ok is True
+        acc.assert_not_called()
+        classify.assert_not_called()
+        assert orch.detector._baseline is None
+
+    @pytest.mark.asyncio
+    async def test_geometry_is_single_roi_source(self, app_config):
+        orch = _orch(app_config)
+        page = _document_frame()
+        geom = orch.detector.detect_geometry(page)
+        assert geom.present and geom.bbox is not None
+        roi = orch.detector.document_preview_roi(page)
+        assert roi == geom.bbox
+        viewer = MagicMock()
+        orch._debug_viewer = viewer
+        orch._publish_debug(page)
+        kwargs = viewer.publish.call_args.kwargs
+        assert kwargs["document_detected"] is True
+        assert kwargs["document_roi"] == "{},{},{},{}".format(*geom.bbox)
+        assert kwargs["reject_reason"] == geom.reason
+
+    @pytest.mark.asyncio
+    async def test_legacy_motion_edge_is_not_authoritative(self, app_config):
+        orch = _orch(app_config)
+        page = _document_frame()
+        legacy = DocumentDetector(app_config.detection)
+        assert legacy.detect(page) is False
+        assert DocumentDetector(app_config.detection).detect_geometry(page).present is True
+        orch.detector.detect = MagicMock(side_effect=AssertionError("legacy detect must not be used"))
+        orch.sm.state = AppState.IDLE
+        orch._safe_preview = AsyncMock(return_value=page)
+        await _idle_until_auto_detected(orch)
+        orch.detector.detect.assert_not_called()
+        assert orch._transaction is not None
+
 

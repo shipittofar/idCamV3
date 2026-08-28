@@ -103,9 +103,9 @@ def gradient_edge_density(gray: np.ndarray, magnitude_threshold: float = 30.0) -
 class DocumentDetector:
     """Document presence from preview frames.
 
-    ``detect_geometry`` is the Phase 2B API: quadrilateral in the current frame.
-    ``detect`` / ``classify`` remain the legacy motion+edge path used by the
-    orchestrator until Phase 2C wiring.
+    ``detect_geometry`` is the production presence API (Phase 2B/2C).
+    ``detect`` / ``classify`` remain the legacy motion+edge path and must not
+    be used for orchestrator presence, stability, or removal.
     """
 
     def __init__(self, config: DetectionConfig) -> None:

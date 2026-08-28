@@ -41,7 +41,11 @@ def app_config(tmp_path):
             min_height=64,
             require_expected_dimensions=False,
         ),
-        detection=DetectionConfig(stable_frames_required=2, removal_frames_required=2),
+        detection=DetectionConfig(
+            stable_frames_required=2,
+            removal_frames_required=2,
+            geometry_stable_frames_required=2,
+        ),
         camera=CameraConfig(recovery=CameraRecoveryConfig(max_attempts=3, delay_seconds=0.05)),
         ui=UIConfig(
             status_file=tmp_path / "run" / "status.json",
@@ -190,8 +194,16 @@ class TestIdleAfterEarlyAbortRegression:
         assert orch.sm.state == AppState.IDLE
         assert not orch.has_active_transaction
 
-        orch.detector.detect = MagicMock(return_value=True)
-        orch._safe_preview = AsyncMock(return_value=np.zeros((10, 10, 3), dtype=np.uint8))
-        await orch._idle_tick()
-        orch.detector.detect.assert_called_once()
+        page = np.zeros((480, 640, 3), dtype=np.uint8)
+        page[60:420, 80:560] = (242, 238, 230)
+        page[60:63, 80:560] = 35
+        page[417:420, 80:560] = 35
+        page[60:420, 80:83] = 35
+        page[60:420, 557:560] = 35
+        orch._safe_preview = AsyncMock(return_value=page)
+        for _ in range(8):
+            await orch._idle_tick()
+            if orch._transaction is not None and orch._transaction.capture_id != "cap-early":
+                break
+        assert orch._transaction is not None
         assert orch._transaction.capture_id != "cap-early"

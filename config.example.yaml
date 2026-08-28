@@ -59,6 +59,10 @@ detection:
   removal_motion_factor: 0.5
   removal_edge_factor: 0.5
   baseline_alpha: 0.05
+  geometry_hold_frames: 3
+  geometry_smooth_alpha: 0.40
+  geometry_stability_threshold_px: 12.0
+  geometry_stable_frames_required: 5
 
 quality:
   min_sharpness: 80.0

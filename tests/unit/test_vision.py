@@ -14,6 +14,8 @@ from idcam.vision.document_detector import (
 )
 from idcam.vision.geometry import bbox_from_corners, bbox_iou, order_corners
 from idcam.vision.sharpness import laplacian_variance, mean_brightness
+from idcam.vision.document_detector import DocumentDetector
+from idcam.vision.geometry_stability import GeometryStability, mean_corner_displacement_px
 from idcam.vision.stability_detector import StabilityDetector
 
 
@@ -446,6 +448,51 @@ class TestDocumentGeometry:
         for cx, cy in geom.corners or ():
             assert 0 <= cx < 1920
             assert 0 <= cy < 1080
+
+
+class TestGeometryStability:
+    def test_first_present_frame_is_not_ready(self, detection_config):
+        gate = GeometryStability(threshold_px=12.0, frames_required=2)
+        detector = DocumentDetector(detection_config)
+        geom = detector.detect_geometry(_page_on_table((480, 640), (80, 60, 480, 360)))
+        assert geom.present is True
+        assert gate.update(geom) is False
+        assert gate.stable_count == 0
+
+    def test_stable_quad_reaches_required_count(self, detection_config):
+        gate = GeometryStability(threshold_px=12.0, frames_required=2)
+        detector = DocumentDetector(detection_config)
+        page = _page_on_table((480, 640), (80, 60, 480, 360))
+        assert gate.update(detector.detect_geometry(page)) is False
+        assert gate.update(detector.detect_geometry(page)) is False
+        assert gate.update(detector.detect_geometry(page)) is True
+        assert gate.stable_count >= 2
+
+    def test_moving_quad_resets_counter(self, detection_config):
+        gate = GeometryStability(threshold_px=12.0, frames_required=3)
+        detector = DocumentDetector(detection_config)
+        a = detector.detect_geometry(_page_on_table((480, 640), (40, 40, 480, 360)))
+        b = detector.detect_geometry(_page_on_table((480, 640), (120, 80, 480, 360)))
+        assert a.present and b.present
+        assert mean_corner_displacement_px(a.corners, b.corners) > 12.0
+        gate.update(a)
+        gate.update(a)
+        assert gate.stable_count >= 1
+        gate.update(b)
+        assert gate.stable_count == 0
+        assert gate.update(b) is False
+
+    def test_absent_resets(self, detection_config):
+        gate = GeometryStability(threshold_px=12.0, frames_required=2)
+        detector = DocumentDetector(detection_config)
+        page = _page_on_table((480, 640), (80, 60, 480, 360))
+        gate.update(detector.detect_geometry(page))
+        gate.update(detector.detect_geometry(page))
+        absent = DocumentGeometryResult(
+            present=False, confidence=0.0, corners=None, bbox=None, reason="no_quadrilateral"
+        )
+        gate.update(absent)
+        assert gate.stable_count == 0
 
 
 class TestSharpness:

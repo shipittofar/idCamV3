@@ -91,6 +91,13 @@ class DetectionConfig(BaseModel):
     # Geometry detector (Phase 2B). Independent of motion_threshold.
     geometry_hold_frames: int = Field(3, ge=1, le=30)
     geometry_smooth_alpha: float = Field(0.40, gt=0, le=1.0)
+    # Geometry stability gate (Phase 2C). Preview pixels, not motion_threshold.
+    # Mean TL/TR/BR/BL corner travel between consecutive detect_geometry results.
+    # At 1920×1080 / ~5 Hz, 12 px is a small page shift, not a place-down sweep.
+    geometry_stability_threshold_px: float = Field(12.0, gt=0, le=200)
+    # Consecutive low-movement geometry frames before auto-capture may start.
+    # At preview_fps=5 this is 1.0 s after the first present observation.
+    geometry_stable_frames_required: int = Field(5, ge=2, le=60)
 
 
 class QualityConfig(BaseModel):

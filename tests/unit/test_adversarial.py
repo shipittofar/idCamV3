@@ -118,9 +118,9 @@ class TestActiveTransactionGuard:
         orch = _make_orch(app_config)
         orch.sm.state = AppState.WAITING_FOR_STABILITY
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-active")
-        orch.detector.detect = MagicMock(return_value=True)
+        orch.detector.detect_geometry = MagicMock(return_value=True)
         await orch._idle_tick()
-        orch.detector.detect.assert_not_called()
+        orch.detector.detect_geometry.assert_not_called()
 
     def test_has_active_transaction_follows_state_machine(self, app_config):
         orch = _make_orch(app_config)
