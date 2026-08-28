@@ -315,3 +315,38 @@ class TestProductionCapturePath:
         encoder_path, encoder_format = fake_camera.instances[0].capture_file_calls[0]
         assert Path(encoder_path).suffix == ".jpg"
         assert encoder_format is not None
+
+    async def test_existing_output_file_is_not_treated_as_new_capture(self, fake_camera, tmp_path):
+        from idcam.camera.capture import CaptureService
+        from idcam.exceptions import CaptureError
+        from idcam.storage.temp_files import TempFileStore
+
+        mgr = _manager()
+        mgr.initialize()
+        store = TempFileStore(tmp_path)
+        service = CaptureService(mgr.config, store)
+        output = store.create_temp_path()
+        old = b"\xff\xd8\xffOLD-CAPTURE"
+        output.write_bytes(old)
+        with pytest.raises(CaptureError, match="already exists"):
+            await service.capture(mgr, output)
+        assert output.read_bytes() == old
+        mgr.shutdown()
+
+    async def test_stale_partial_is_not_finalized_as_success(self, fake_camera, tmp_path):
+        from idcam.camera.capture import CaptureService
+        from idcam.exceptions import CaptureError
+        from idcam.storage.temp_files import TempFileStore
+
+        mgr = _manager()
+        mgr.initialize()
+        store = TempFileStore(tmp_path)
+        service = CaptureService(mgr.config, store)
+        output = store.create_temp_path()
+        partial = store.create_partial_path(output)
+        partial.write_bytes(b"\xff\xd8\xffSTALE")
+        fake_camera.instances[0].capture_file = lambda *a, **k: None
+        with pytest.raises(CaptureError):
+            await service.capture(mgr, output)
+        assert not output.exists()
+        mgr.shutdown()

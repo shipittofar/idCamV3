@@ -26,7 +26,12 @@ class CaptureService:
         self.temp_store = temp_store
 
     async def capture(self, camera: CaptureCapableCamera, output_path: Path) -> Path:
+        if output_path.exists():
+            raise CaptureError(f"Capture target already exists: {output_path}")
         partial_path = self.temp_store.create_partial_path(output_path)
+        if partial_path.exists():
+            logger.warning("event=capture_stale_partial_removed path=%s", partial_path)
+            self.temp_store.cleanup(partial_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         logger.info("event=capture_started path=%s", output_path)
 

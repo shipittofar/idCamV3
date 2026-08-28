@@ -12,6 +12,7 @@ from idcam.app.state_machine import AppState
 from idcam.app.transaction import ActiveCaptureTransaction
 from idcam.camera.autofocus import AutofocusResult
 from idcam.config.schema import AppConfig, CameraConfig, DetectionConfig, QualityConfig, ServerConfig, UIConfig
+from idcam.exceptions import AutofocusError, CaptureError
 from idcam.network.protocol import ServerResponse, UploadOutcome
 from idcam.system.component_health import ComponentStatus, HealthLevel
 from idcam.vision.document_detector import DocumentDetector
@@ -498,5 +499,128 @@ class TestPhase2CGeometryPolicy:
         await _idle_until_auto_detected(orch)
         orch.detector.detect.assert_not_called()
         assert orch._transaction is not None
+
+
+class TestPhase2DFocusCaptureHandoff:
+    @pytest.mark.asyncio
+    async def test_ready_triggers_autofocus_exactly_once(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        orch.autofocus.run_autofocus = AsyncMock(
+            return_value=AutofocusResult(True, 35.0, 1, None, "hardware_trigger", 28.0, 10.0, True)
+        )
+        await _idle_until_auto_detected(orch)
+        await orch._document_detected_tick()
+        for _ in range(8):
+            await orch._stability_tick()
+            if orch.sm.state == AppState.FOCUSING:
+                break
+        assert orch.sm.state == AppState.FOCUSING
+        await orch._focusing_tick()
+        assert orch.autofocus.run_autofocus.await_count == 1
+        orch.sm.state = AppState.FOCUSING
+        orch._state_action_claimed = AppState.FOCUSING
+        await orch._focusing_tick()
+        assert orch.autofocus.run_autofocus.await_count == 1
+        roi = orch.autofocus.run_autofocus.await_args.kwargs["preview_roi"]
+        assert roi == orch._accepted_geometry.bbox
+
+    @pytest.mark.asyncio
+    async def test_autofocus_failure_is_not_capture_success(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.FOCUSING
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-af-fail")
+        orch._safe_preview = AsyncMock(return_value=_document_frame())
+        orch.autofocus.run_autofocus = AsyncMock(side_effect=AutofocusError("lens failed"))
+        await orch._focusing_tick()
+        assert orch.sm.state == AppState.IDLE
+        assert orch.sm.state != AppState.CAPTURING
+        assert orch.sm.state != AppState.SUCCESS
+        assert orch._awaiting_clear_scene is True
+        assert orch._capture_path is None
+
+    @pytest.mark.asyncio
+    async def test_successful_autofocus_proceeds_to_capture(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.FOCUSING
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        page = _document_frame()
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
+        orch.autofocus.run_autofocus = AsyncMock(
+            return_value=AutofocusResult(True, 90.0, 1, None, "hardware_cycle", 10.0)
+        )
+        orch.autofocus.verify_focus = AsyncMock(
+            return_value=AutofocusResult(True, 90.0, 0, None, "verification", 10.0)
+        )
+        await orch._focusing_tick()
+        assert orch.sm.state == AppState.FOCUS_VERIFICATION
+        await orch._focus_verification_tick()
+        assert orch.sm.state == AppState.CAPTURING
+
+    @pytest.mark.asyncio
+    async def test_capture_failure_does_not_become_success(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.CAPTURING
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        page = _document_frame()
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
+        orch.capture_service.capture = AsyncMock(side_effect=CaptureError("encoder failed"))
+        await orch._capturing_tick()
+        assert orch.sm.state != AppState.IMAGE_VALIDATION
+        assert orch.sm.state != AppState.SUCCESS
+        assert orch.sm.state == AppState.RECOVERY
+
+    @pytest.mark.asyncio
+    async def test_capture_time_geometry_movement_aborts(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.CAPTURING
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        still = _document_frame(box=(80, 60, 480, 360))
+        moved = _document_frame(box=(180, 120, 400, 300))
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(still))
+        orch._safe_preview = AsyncMock(return_value=moved)
+        capture = AsyncMock()
+        orch.capture_service.capture = capture
+        await orch._capturing_tick()
+        capture.assert_not_called()
+        assert orch.sm.state != AppState.IMAGE_VALIDATION
+        assert orch.sm.state != AppState.SUCCESS
+        assert orch._awaiting_clear_scene is True
+
+    @pytest.mark.asyncio
+    async def test_stable_geometry_allows_capture(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.CAPTURING
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        page = _document_frame()
+        orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
+
+        async def fake_capture(_camera, path):
+            path.write_bytes(b"\xff\xd8\xff" + b"\x00" * 500)
+            return path
+
+        orch.capture_service.capture = fake_capture
+        await orch._capturing_tick()
+        assert orch.sm.state == AppState.IMAGE_VALIDATION
+        assert orch._capture_path is not None
+
+    @pytest.mark.asyncio
+    async def test_accepted_roi_not_replaced_by_search_rect(self, app_config):
+        orch = _orch(app_config)
+        page = _document_frame()
+        geom = orch.detector.detect_geometry(page)
+        orch._snapshot_accepted_geometry(geom)
+        search = orch.detector.roi_rect(page.shape)
+        assert geom.bbox != search
+        assert orch._accepted_preview_roi(page) == geom.bbox
+        empty = _empty_frame()
+        assert orch._accepted_preview_roi(empty) == geom.bbox
+
 
 

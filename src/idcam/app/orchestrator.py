@@ -43,6 +43,7 @@ from idcam.ui.status import StatusPublisher
 from idcam.vision.document_detector import DocumentDetector, DocumentGeometryResult
 from idcam.vision.geometry import find_document_quad
 from idcam.vision.geometry_stability import GeometryStability, mean_corner_displacement_px
+from idcam.vision.sharpness import clip_roi
 
 logger = get_logger("orchestrator")
 
@@ -100,6 +101,7 @@ class ApplicationOrchestrator:
         self._debug_viewer: LiveDebugViewer | None = None
         self._idle_reject_count = 0
         self._last_geometry_status = ""
+        self._accepted_geometry: DocumentGeometryResult | None = None
         self._cmd_lock = threading.Lock()
         self._pending_command: str | None = None
         self._command_result: dict | None = None
@@ -353,24 +355,44 @@ class ApplicationOrchestrator:
             self._logged_preview_rgb = True
         return frame
 
+    def _snapshot_accepted_geometry(self, geom: DocumentGeometryResult | None) -> None:
+        """Freeze the READY document location for AF, verify, and capture-time abort."""
+        if geom is not None and geom.present and geom.bbox is not None and geom.corners is not None:
+            self._accepted_geometry = geom
+            return
+        self._accepted_geometry = None
+
+    def _accepted_preview_roi(self, frame=None) -> tuple[int, int, int, int]:
+        geom = self._accepted_geometry
+        if geom is not None and geom.bbox is not None:
+            if frame is not None:
+                return clip_roi(geom.bbox, frame.shape)
+            return geom.bbox
+        return self.detector.document_preview_roi(frame)
+
     def _observe_geometry(self, frame) -> tuple[DocumentGeometryResult, bool]:
         """Authoritative presence + the single geometry-stability gate."""
         geom = self.detector.detect_geometry(frame)
         ready = self.geometry_stability.update(geom)
         return geom, ready
 
-    def _geometry_moved_readonly(self, frame) -> bool:
-        """Capture-time jitter vs last accepted corners. Does not mutate detector state."""
-        previous = self.geometry_stability.corners
+    def _geometry_moved_readonly(self, frame) -> tuple[bool, float]:
+        """Capture-time jitter vs accepted READY corners. Does not mutate detector state."""
+        previous = None
+        if self._accepted_geometry is not None and self._accepted_geometry.corners is not None:
+            previous = self._accepted_geometry.corners_array()
+        if previous is None:
+            previous = self.geometry_stability.corners
         if previous is None:
             last = self.detector.last_geometry()
             if last.corners is None:
-                return False
+                return False, 0.0
             previous = last.corners_array()
         raw, _count = find_document_quad(frame)
         if raw is None:
-            return True
-        return mean_corner_displacement_px(previous, raw.corners) > self.geometry_stability.threshold_px
+            return True, float("inf")
+        displacement = mean_corner_displacement_px(previous, raw.corners)
+        return displacement > self.geometry_stability.threshold_px, displacement
 
     def _log_geometry_status(self, status: str, geom: DocumentGeometryResult) -> None:
         if status == self._last_geometry_status:
@@ -400,12 +422,22 @@ class ApplicationOrchestrator:
         frame = await self._safe_preview()
         if frame is None:
             return False
-        moving = self._geometry_moved_readonly(frame)
+        moving, displacement = self._geometry_moved_readonly(frame)
         self._publish_debug(frame)
         if moving:
-            logger.warning("event=document_moved_during_capture_phase state=%s", self.sm.state.value)
+            logger.warning(
+                "event=capture_geometry_abort state=%s displacement_px=%.2f threshold_px=%.2f",
+                self.sm.state.value,
+                displacement,
+                self.geometry_stability.threshold_px,
+            )
             await self._fail_transaction_and_wait("stability_timeout", "Document moved during capture")
             return False
+        logger.info(
+            "event=capture_geometry_check passed=1 displacement_px=%.2f threshold_px=%.2f",
+            displacement,
+            self.geometry_stability.threshold_px,
+        )
         return True
 
     async def _idle_tick(self) -> None:
@@ -577,6 +609,7 @@ class ApplicationOrchestrator:
             return
         if self._transaction and self._transaction.trigger == "manual":
             self._set_manual_phase("focusing", "Focusing...")
+            self._snapshot_accepted_geometry(self.detector.last_geometry())
             self._transition(AppState.FOCUSING, reason="manual_capture_skip_stability")
             return
         self._transition(AppState.WAITING_FOR_STABILITY, reason="auto_wait_stability")
@@ -594,6 +627,16 @@ class ApplicationOrchestrator:
         if ready:
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
+                "event=document_ready capture_id=%s reason=%s confidence=%.3f bbox=%s "
+                "stable_count=%d displacement_px=%.2f",
+                self._transaction.capture_id if self._transaction else None,
+                geom.reason,
+                geom.confidence,
+                geom.bbox,
+                self.geometry_stability.stable_count,
+                self.geometry_stability.last_displacement_px,
+            )
+            logger.info(
                 "event=document_stable frames=%d displacement_px=%.2f threshold_px=%.2f",
                 self.geometry_stability.stable_count,
                 self.geometry_stability.last_displacement_px,
@@ -601,6 +644,7 @@ class ApplicationOrchestrator:
             )
             assert self._transaction is not None
             self._transaction.phase = TransactionPhase.STABILIZING
+            self._snapshot_accepted_geometry(geom)
             logger.info("event=pipeline_stage stage=focusing reason=document_stable")
             self._set_manual_phase("focusing", "Focusing...")
             self._transition(AppState.FOCUSING, reason="document_stable")
@@ -616,15 +660,21 @@ class ApplicationOrchestrator:
         if self._shutdown_event.is_set():
             return
         # Lens motion during AF must not be treated as the document moving.
+        # ROI is the frozen READY geometry, not a live re-detect (avoids 70% search fallback).
         frame = await self._safe_preview()
         if frame is None:
             return
-        self.detector.detect_geometry(frame)
-        preview_roi = self.detector.document_preview_roi(frame)
+        preview_roi = self._accepted_preview_roi(frame)
         self._publish_debug(frame)
         self._transaction.mark_focus_started()
         self._transaction.focus_attempts += 1
         self._set_manual_phase("focusing", "Focusing...")
+        logger.info(
+            "event=autofocus_start capture_id=%s preview_roi=%s accepted_bbox=%s",
+            self._transaction.capture_id,
+            preview_roi,
+            None if self._accepted_geometry is None else self._accepted_geometry.bbox,
+        )
         logger.info(
             "event=pipeline_stage stage=focusing capture_id=%s preview_roi=%s",
             self._transaction.capture_id,
@@ -644,6 +694,13 @@ class ApplicationOrchestrator:
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
             logger.info(
+                "event=autofocus_result capture_id=%s success=1 method=%s sharpness=%.1f ratio=%.2f",
+                self._transaction.capture_id,
+                result.method,
+                result.sharpness,
+                result.improvement_ratio,
+            )
+            logger.info(
                 "event=pipeline_stage stage=focus_verification method=%s sharpness=%.1f ratio=%.2f",
                 result.method,
                 result.sharpness,
@@ -651,7 +708,11 @@ class ApplicationOrchestrator:
             )
             self._transition(AppState.FOCUS_VERIFICATION, reason="autofocus_accepted")
         except AutofocusError as exc:
-            logger.error("event=autofocus_failed %s", exc)
+            logger.error(
+                "event=autofocus_result capture_id=%s success=0 error=%s",
+                self._transaction.capture_id,
+                exc,
+            )
             await self._fail_transaction_and_wait("focus_failed", str(exc))
 
     async def _focus_verification_tick(self) -> None:
@@ -660,7 +721,7 @@ class ApplicationOrchestrator:
         assert self._transaction is not None
         min_sharp = self.config.quality.min_sharpness * 0.6
         self._transaction.focus_verify_attempts += 1
-        preview_roi = self.detector.document_preview_roi()
+        preview_roi = self._accepted_preview_roi()
         try:
             result = await self.autofocus.verify_focus(
                 self.camera,
@@ -690,13 +751,28 @@ class ApplicationOrchestrator:
         self._transaction.mark_capture_started(str(output_path))
         self._capture_started = True
         self._set_manual_phase("capturing", "Capturing...")
+        logger.info(
+            "event=capture_start capture_id=%s path=%s accepted_bbox=%s",
+            self._transaction.capture_id,
+            output_path,
+            None if self._accepted_geometry is None else self._accepted_geometry.bbox,
+        )
         logger.info("event=pipeline_stage stage=capturing path=%s", output_path)
         try:
             self._capture_path = await self.capture_service.capture(self.camera, output_path)
             self.sm.touch_progress()
+            logger.info(
+                "event=capture_result capture_id=%s success=1 path=%s",
+                self._transaction.capture_id,
+                self._capture_path,
+            )
             self._transition(AppState.IMAGE_VALIDATION)
         except CaptureError as exc:
-            logger.error("event=capture_failed %s", exc)
+            logger.error(
+                "event=capture_result capture_id=%s success=0 error=%s",
+                self._transaction.capture_id,
+                exc,
+            )
             self.temp_store.cleanup(output_path)
             await self._enter_recovery(str(exc))
 
@@ -982,6 +1058,7 @@ class ApplicationOrchestrator:
             }
         )
         self.geometry_stability.reset()
+        self._accepted_geometry = None
         if dest == AppState.IDLE:
             self._awaiting_clear_scene = True
             self._clear_scene_count = 0
@@ -1001,6 +1078,7 @@ class ApplicationOrchestrator:
         self._transaction = None
         self._capture_path = None
         self._pending_response = None
+        self._accepted_geometry = None
         set_log_context(capture_id=None)
 
     def _refresh_health(self) -> None:
