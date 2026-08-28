@@ -76,3 +76,23 @@ def mean_brightness(frame: np.ndarray) -> float:
     else:
         gray = frame
     return float(np.mean(gray))
+
+
+def reconstruct_preview_view(
+    still_rgb: np.ndarray,
+    scaler_crop: tuple[int, int, int, int],
+    preview_size: tuple[int, int],
+) -> np.ndarray:
+    """Map the still JPEG through ScalerCrop and resize to the preview pixel grid.
+
+    Preview AF Laplacian is computed on this same 1080p geometry. A 4:3 64MP
+    still must not be stretched to 16:9; only the live ScalerCrop window is used.
+    """
+    fw, fh = int(preview_size[0]), int(preview_size[1])
+    if fw < 1 or fh < 1:
+        raise ValueError("invalid_preview_size")
+    sx, sy, sw, sh = clip_roi(scaler_crop, still_rgb.shape)
+    window = still_rgb[sy : sy + sh, sx : sx + sw]
+    if window.size == 0:
+        raise ValueError("invalid_scaler_crop")
+    return cv2.resize(window, (fw, fh), interpolation=cv2.INTER_AREA)

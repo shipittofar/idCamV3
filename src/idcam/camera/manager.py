@@ -225,6 +225,18 @@ def preview_roi_to_af_window(
     }
 
 
+def preview_roi_to_still_roi(
+    preview_roi: tuple[int, int, int, int],
+    preview_size: tuple[int, int],
+    scaler_crop: tuple[int, int, int, int],
+    still_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Map a preview-pixel document bbox into still-JPEG pixel coordinates."""
+    mapped = preview_roi_to_af_window(preview_roi, preview_size, scaler_crop)
+    sw, sh = int(still_size[0]), int(still_size[1])
+    return clip_xywh_to_bounds(mapped["sensor_roi"], (0, 0, sw, sh))
+
+
 def normalize_picamera_preview_frame(frame: np.ndarray) -> np.ndarray:
     """Convert a Picamera2 RGB888/XRGB8888 ndarray to RGB channel order.
 

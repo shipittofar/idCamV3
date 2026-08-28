@@ -12,7 +12,7 @@ from idcam.app.state_machine import AppState
 from idcam.app.transaction import ActiveCaptureTransaction
 from idcam.camera.autofocus import AutofocusResult
 from idcam.config.schema import AppConfig, CameraConfig, DetectionConfig, QualityConfig, ServerConfig, UIConfig
-from idcam.exceptions import AutofocusError, CaptureError
+from idcam.exceptions import AutofocusError, CaptureError, ImageValidationError
 from idcam.network.protocol import ServerResponse, UploadOutcome
 from idcam.system.component_health import ComponentStatus, HealthLevel
 from idcam.vision.document_detector import DocumentDetector, DocumentGeometryResult
@@ -234,6 +234,22 @@ class TestAutoDetectStableFocusCapture:
         assert orch.sm.state == AppState.CAPTURING
         await orch._capturing_tick()
         assert orch.sm.state == AppState.IMAGE_VALIDATION
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_does_not_upload(self, app_config, tmp_path):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IMAGE_VALIDATION
+        orch._resume_state = AppState.IDLE
+        orch._transaction = ActiveCaptureTransaction(capture_id="cap-blur")
+        path = tmp_path / "cap.jpg"
+        path.write_bytes(b"\xff\xd8\xff" + b"\x00" * 200)
+        orch._capture_path = path
+        orch.validator.validate = MagicMock(side_effect=ImageValidationError("Image too blurry"))
+        orch.api.upload_document = AsyncMock()
+        await orch._validation_tick()
+        orch.api.upload_document.assert_not_called()
+        assert orch.sm.state != AppState.UPLOADING
+        assert orch.sm.state != AppState.SUCCESS
 
 
 class TestRemovalHold:

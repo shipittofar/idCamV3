@@ -861,8 +861,25 @@ class ApplicationOrchestrator:
         assert self._capture_path is not None
         self._set_manual_phase("validating", "Validating image...")
         logger.info("event=pipeline_stage stage=image_validation path=%s", self._capture_path)
+        preview_roi = self._accepted_preview_roi(allow_search_fallback=False)
+        preview_size = (int(self.config.camera.preview_width), int(self.config.camera.preview_height))
+        scaler_crop = None
+        crop_fn = getattr(self.camera, "current_scaler_crop", None)
+        if callable(crop_fn):
+            try:
+                scaler_crop = crop_fn()
+            except Exception:
+                scaler_crop = None
+        require_roi = self._transaction.trigger == "auto" or self._accepted_geometry is not None
         try:
-            result = self.validator.validate(self._capture_path)
+            result = self.validator.validate(
+                self._capture_path,
+                preview_roi=preview_roi,
+                preview_size=preview_size,
+                scaler_crop=scaler_crop,
+                preview_sharpness=self._transaction.sharpness_score,
+                require_document_roi=require_roi,
+            )
             self._transaction.mark_validated(
                 size=result.file_bytes,
                 width=result.width,
