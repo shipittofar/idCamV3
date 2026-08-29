@@ -39,7 +39,8 @@ There are no labeled Raspberry Pi passport stills in-repo for this fix (`_diagou
 - **Two-page merge:** if two passing quads are side-by-side (similar height, high vertical overlap, small gap / slight overlap at the fold, combined aspect 1.45–3.45, combined area ≥ 16%), emit **one** outer quad `geometry_mode=merged_two_page` from left TL + right TR/BR + left BL.
 - **Inner suppression:** drop a quad contained in a **merged** (or ≥1.75× area) outer booklet so page L/R are not chosen instead of the passport.
 - **minAreaRect fallback:** only for contours with area 20–85% when `approxPolyDP` is not 4-sided (fold notches). Not used for near-full-frame blobs.
-- **Frame protection:** reject quads with **≥3 corners** within 4 px of the image border (`frame_aligned`). One-edge proximity is still allowed. Ranking slightly penalizes `border_distance < 2.5` so a page is preferred over a quad that swallowed the left/right margin.
+- **Frame protection:** reject quads whose axis-aligned box spans **all four** image sides (`frame_aligned`) — the preview rectangle itself (Pi C3). A page that only hits top and bottom of a 16:9 frame is allowed. Ranking still penalizes `border_distance < 2.5`.
+- **Paper region (Pi CASE A):** illumination-normalized Canny sees hollow/broken outlines on real preview. Filled blobs are taken from **unnormalized** gray vs left/right table strips (`geometry_mode=paper_region`). Fold close can feed the existing two-page merge. `MIN_RECTANGULARITY` / `MIN_CONFIDENCE` were not lowered.
 - **False merge:** two distant rectangles fail the gap test (`MERGE_MAX_GAP_FRAC = 0.12` of the thinner page). They must not become one document.
 
 ### Logging
@@ -71,6 +72,7 @@ New module `tests/unit/test_large_two_page_geometry.py`:
 | F Strong center seam | `test_strong_center_seam` |
 | G Uneven page brightness | `test_uneven_page_brightness` |
 | H Close to frame | `test_close_to_frame_boundaries` |
+| Clipped 16:9 preview | `test_vertically_clipped_opened_passport`, `test_clipped_page_without_drawn_border` |
 | I Large rect on table | page detected; empty wood not |
 | J Two unrelated side-by-side | `test_two_unrelated_rectangles_are_not_merged` (union IoU &lt; 0.55) |
 | AF ROI inside passport | `test_bbox_stays_inside_passport` |
@@ -79,9 +81,7 @@ Existing `tests/unit/test_vision.py` geometry cases still pass (empty table, han
 
 ## 4. Hardware status
 
-**PENDING** — not run on the Raspberry Pi for this change.
-
-Validate on device: opened passport (one AF ROI over both pages), 30–90% occupancy, small margin, lighting/fold shadow, and two separate cards that must **not** merge.
+**PENDING** — Pi debug script (2026-08-29) proved CASE A on live preview (`docs/PASSPORT_DETECTION_RUNTIME_DEBUG.md`). Re-run that script after deploying this paper-region / `frame_aligned` change. Empty table, hands, and two distant rectangles remain unit-tested.
 
 ## 5. Status line
 

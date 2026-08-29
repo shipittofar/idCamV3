@@ -1,47 +1,29 @@
 # Passport Detection Runtime Debug
 
-**Status: ROOT CAUSE NOT YET PROVEN ON THE PI — FIX NOT IMPLEMENTED**
+**Pi evidence: CASE A. Software follow-up is in git; re-run the script on the Pi to prove the camera path.**
 
-This environment is a Windows checkout. It cannot inspect `systemd` on the Raspberry Pi, capture the live preview the service sees, or confirm `/opt/idcam/venv` matches git. No live opened-passport JPEG was available in the repo (`_diagout/preview.png` is gone).
+This environment is a Windows checkout. Hardware confirmation still requires `passport_detection_debug.py` on the Raspberry Pi after deploying this tree.
 
-What this change **does** provide: a diagnostic path that uses the **same** `find_document_quad` accept/reject rules, dumps **effective** constants from the imported module, saves the **exact preview array**, and labels CASE A–G from that frame.
+## Runtime Code Verification (Pi, 2026-08-29)
 
-Do not treat synthetic unit-test passports as Pi proof. Those already pass; the Pi failure is still unexplained until the script below is run on device.
-
-## Runtime Code Verification
-
-**This workstation:** not the idcam service.
-
-**What the Pi service is *supposed* to run** (`deploy/idcam.service`):
-
-| Item | Value |
-|---|---|
-| Unit | `idcam.service` |
-| `ExecStart` | `/opt/idcam/venv/bin/idcam` |
-| `Environment` | `IDCAM_CONFIG=/etc/idcam/config.yaml` |
-| WorkingDirectory | `/var/lib/idcam` |
-| `PrivateTmp` | **true** — the service’s `/tmp` is **not** the host `/tmp` |
-| `ProtectHome` | true |
-
-If the device was not redeployed after the large-document patch, the service can still be running **old** `geometry.py` (`MAX_ASPECT=2.60`, no `merged_two_page`). That would explain “384 passed in git” vs “passport not detected on Pi”. **Prove it on the Pi:**
+Command:
 
 ```bash
-systemctl show idcam -p FragmentPath -p ExecStart -p MainPID -p ActiveState
-readlink -f /proc/$(systemctl show -p MainPID --value idcam)/exe
-/opt/idcam/venv/bin/python -c "import idcam.vision.geometry as g; print(g.__file__); print('MAX_ASPECT', g.MAX_ASPECT); print('merged', 'merged_two_page' in open(g.__file__, encoding='utf-8').read())"
+sudo -u idcam /opt/idcam/venv/bin/python \
+  ~/Desktop/idCamV3/scripts/passport_detection_debug.py \
+  --save-dir /tmp --frames 5
 ```
 
-If `MAX_ASPECT` is not `3.35` or `merged` is `False`, the previous fix is **not** the running code. Stop there and deploy; do not retune thresholds.
+That interpreter **preloads Desktop `src`**, so it is **not** the installed `/opt/idcam` package. Printed `geometry_module` was `/home/moj/Desktop/idCamV3/src/idcam/vision/geometry.py` with `MAX_ASPECT=3.35` and merge helpers present. `idcam.service` was **inactive**. When debugging the **service**, import `idcam.vision.geometry` **without** putting Desktop `src` on `sys.path`.
+
+`PrivateTmp=true`: daemon `/tmp` is not the host `/tmp`.
 
 ## Effective Configuration
 
-Printed by the imported module (git checkout values). **Pi must print the same from `/opt/idcam/venv`.**
+Unchanged hard filters (not globally lowered):
 
-Geometry constants (`src/idcam/vision/geometry.py`, not YAML):
-
-| Name | Git value |
+| Name | Value |
 |---|---|
-| WORKING_WIDTH | 960 |
 | MIN_AREA_FRACTION | 0.08 |
 | MAX_AREA_FRACTION | 0.97 |
 | MIN_ASPECT | 0.40 |
@@ -49,106 +31,55 @@ Geometry constants (`src/idcam/vision/geometry.py`, not YAML):
 | MIN_RECTANGULARITY | 0.72 |
 | MIN_CONFIDENCE | 0.48 |
 | MIN_RIGHT_ANGLE | 0.55 |
-| MERGE_MIN_HEIGHT_RATIO | 0.82 |
-| MERGE_MIN_VERTICAL_OVERLAP | 0.78 |
-| MERGE_MAX_GAP_FRAC | 0.12 |
-| MERGE_MIN_GAP_FRAC | -0.08 |
-| MERGE_MIN_ASPECT | 1.45 |
-| MERGE_MAX_ASPECT | 3.45 |
-| MERGE_MIN_AREA | 0.16 |
 
-DetectionConfig defaults (overridable in `/etc/idcam/config.yaml`):
+## Observed Candidate Pipeline (live 1920×1080 preview)
 
-| Name | Default |
-|---|---|
-| geometry_hold_frames | 3 |
-| geometry_smooth_alpha | 0.40 |
-| geometry_stability_threshold_px | 12.0 |
-| geometry_stable_frames_required | 5 |
-| removal_frames_required | 10 |
+`candidate_count_returned=0`, `accepted=0`, `merge_attempts=0`, `detector_reason=no_quadrilateral`, **CASE A**.
 
-These geometry **filters were not changed** in this debugging task.
+| ID | bbox | area_ratio | aspect | rectangularity | reject |
+|---|---|---|---|---|---|
+| C1 | — | 0.044 | 0 | 0 | `area_too_small` |
+| C2 | 58,0,1112,1078 | 0.109 | 0.52 | **0.185** | `low_rectangularity` (touches top+bottom; contour area ≪ bbox) |
+| C3 | 0,0,1918,1078 | 0.188 | **3.77** | 0.189 | `aspect_out_of_range` (full-frame degenerate) |
 
-## Observed Candidate Pipeline
+Merge never ran (no accepted quads) → not CASE B.
 
-Not available from a real Pi passport frame.
-
-Synthetic opened-passport fixtures in `tests/unit/test_large_two_page_geometry.py` **are detected** in unit tests. That only proves the algorithm can work on drawings, not on Hawkeye preview lighting/fold/texture.
+Saved on the Pi: `/tmp/idcam_passport_debug.jpg`, `/tmp/idcam_passport_debug_overlay.jpg`.
 
 ## Exact Failure Stage
 
-**Unknown on hardware (CASE not assigned).**
+**CASE A** on illumination-normalized Canny/Sobel: no filled outer 4-gon. The booklet is **vertically clipped** (C2 `y=0`, `height=1078`). Normalize (`gray/blur*128`) removes paper-vs-table brightness, so only thin/broken edges remain. Lowering `MIN_RECTANGULARITY` would accept C2/C3 garbage.
 
-How the Pi script assigns a case from **one saved preview**:
-
-| Case | Meaning |
-|---|---|
-| A | No accepted quad; a large/wide hull was rejected (`not_quadrilateral`, rectangularity, angles, …) |
-| B | ≥2 page-like accepted quads; merge missing or only `horizontal_gap` / `height_ratio` / `vertical_overlap` |
-| C | Merge geometry built then rejected (`merge_geometry_rejected` / aspect / confidence) |
-| D | Finder has a final quad; `detect_geometry` `present=0` (hold/smooth) |
-| E | Not classified by this detector-only tool (orchestrator would need logs) |
-| F | No usable contours (area/perimeter) — preview may lack outer edges |
-| G | Success, or leftover / unclassified |
-
-## Debug Frame
-
-**Not captured here.**
-
-On the Pi, **stop idcam first** (camera exclusive), then:
-
-```bash
-sudo systemctl stop idcam
-sudo -u idcam /opt/idcam/venv/bin/python /opt/idcam/scripts/passport_detection_debug.py \
-    --save-dir /tmp --frames 5
-```
-
-Writes:
-
-- `/tmp/idcam_passport_debug.jpg` — copy of the preview array the finder used
-- `/tmp/idcam_passport_debug_overlay.jpg` — labeled C1 REJECT / ACCEPT, MERGE, FINAL
-
-To dump from the **running** service (host `/tmp` will **not** see service writes because of `PrivateTmp`):
-
-```bash
-sudo mkdir -p /var/lib/idcam/tmp
-# add to /etc/idcam/environment:
-# IDCAM_GEOMETRY_DEBUG=1
-# IDCAM_GEOMETRY_DEBUG_DIR=/var/lib/idcam/tmp
-sudo systemctl restart idcam
-# place passport, wait ≥2s, then:
-ls -l /var/lib/idcam/tmp/idcam_passport_debug.jpg
-journalctl -u idcam | grep document_detection_debug
-```
-
-Rate limit: **2 seconds**. Event: `event=document_detection_debug`.
+A second bug: **≥3 corners on the image border** was treated as `frame_aligned`. A clipped passport has all four corners on the top and bottom edges, so a *correct* filled quad would have been rejected even if rectangularity passed.
 
 ## Root Cause
 
-**Not identified on the Pi.** Fixing thresholds without the overlay + `MAX_ASPECT` printout would be speculation.
+1. Edge-only search on normalized gray never yields a filled rectangular passport on Hawkeye preview (no drawn dark border).
+2. `frame_aligned` used corner-on-border count instead of “quad spans **both** width and height of the frame” (C3), which also blocked a vertically clipped page (C2 geometry).
 
-Hypotheses **to confirm**, not conclusions:
+## Implemented Fix (minimum change)
 
-1. Service still serving pre-merge `geometry.py`.
-2. CASE B: pages detected, fold gap larger than `0.12 * min(page_width)` so merge never runs.
-3. CASE F: Canny/Sobel on real preview never forms page or outer contours.
-4. CASE A: outer contour exists but `approxPolyDP` ≠ 4 and min-rect fallback gated off (area not in 20–85%).
+In `src/idcam/vision/geometry.py`:
 
-## Recommended Fix
+1. **`paper_region` candidates** from **unnormalized** working gray: left/right strips as table reference, bright blobs, morph open/close, `RETR_EXTERNAL`, hull area, `minAreaRect` allowed. Existing two-page merge still applies if the fold splits two blobs.
+2. **`frame_aligned`** only if the quad’s AABB spans **left and right and top and bottom** (the image rectangle). Top+bottom clip with left/right table remaining is allowed.
 
-**Do not implement a detection fix yet.**
+Rectangularity 0.72 and confidence 0.48 are unchanged.
 
-1. Run `passport_detection_debug.py` on the Pi with an opened passport under the camera.
-2. Confirm venv `MAX_ASPECT` and `merged_two_page` in the **same** interpreter as `ExecStart`.
-3. Attach `/tmp/idcam_passport_debug.jpg`, overlay, printed CASE, candidate JSON, merge JSON.
-4. Only then apply a **minimum** change aimed at that CASE (e.g. merge gap if B and measured `horizontal_gap` is just above the limit).
+## Re-verify on the Pi
 
-Negative case (two far rectangles) remains covered by unit tests; merge records `horizontal_gap` when pairs are considered.
+```bash
+sudo systemctl stop idcam
+sudo -u idcam /opt/idcam/venv/bin/python ~/Desktop/idCamV3/scripts/passport_detection_debug.py \
+    --save-dir /tmp --frames 5
+```
 
-## Tests (this change)
+Expect `accepted≥1`, a bbox that is not full-frame C3, overlay `FINAL`, and `geometry_mode` often `paper_region` or `merged_two_page`. Then restart the service from the **same** tree you intend to run.
+
+## Tests
 
 ```text
 python -m pytest tests -q --tb=line
 ```
 
-**388 passed, 6 skipped** in 40.46 s (this environment, 2026-08-29). New tests: `tests/unit/test_geometry_debug.py`.
+**389 passed, 6 skipped** (this environment, 2026-08-29). New regressions: `test_vertically_clipped_opened_passport`, `test_clipped_page_without_drawn_border`.

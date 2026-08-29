@@ -166,11 +166,27 @@ class TestOpenedPassport:
         assert geom.present is True
         assert bbox_iou(geom.bbox, box) > 0.65
 
-    def test_close_to_frame_boundaries(self, detection_config):
-        box = (12, 10, 1896, 1058)
-        geom = DocumentDetector(detection_config).detect_geometry(_page((1080, 1920), box))
+    def test_vertically_clipped_opened_passport(self, detection_config):
+        """Pi CASE A: passport hits the top and bottom of 1920×1080 preview."""
+        box = (80, 0, 1400, 1080)
+        frame = _opened_passport((1080, 1920), box, seam_px=10)
+        geom = DocumentDetector(detection_config).detect_geometry(frame)
         assert geom.present is True
         assert geom.bbox is not None
+        assert geom.bbox[2] > 900
+        assert bbox_iou(geom.bbox, box) > 0.55
+
+    def test_clipped_page_without_drawn_border(self, detection_config):
+        """Hawkeye preview has no synthetic dark outline; paper vs table must carry it."""
+        img = _wood_table((1080, 1920))
+        box = (80, 0, 1400, 1080)
+        x, y, pw, ph = box
+        img[y : y + ph, x : x + pw] = (242, 238, 230)
+        geom = DocumentDetector(detection_config).detect_geometry(img)
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert bbox_iou(geom.bbox, box) > 0.55
+        assert geom.geometry_mode in ("paper_region", "min_rect_fallback", "quad", "merged_two_page")
 
 
 class TestNegatives:

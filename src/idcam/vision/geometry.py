@@ -120,13 +120,18 @@ def _border_distance(corners: np.ndarray, width: int, height: int) -> float:
     return float(np.min(d))
 
 
-def _corner_on_border_count(corners: np.ndarray, width: int, height: int, *, px: float = 3.0) -> int:
+def _is_full_frame_quad(corners: np.ndarray, width: int, height: int, *, px: float = 4.0) -> bool:
+    """True when the quad is the image rectangle (all four sides), not a clipped page.
+
+    A passport that hits the top and bottom of a 16:9 preview has four corners on
+    the border; rejecting that as ``frame_aligned`` was the Pi CASE A false reject.
+    """
     pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
-    n = 0
-    for x, y in pts:
-        if x <= px or y <= px or x >= width - 1 - px or y >= height - 1 - px:
-            n += 1
-    return n
+    x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
+    x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
+    spans_w = x0 <= px and x1 >= width - 1 - px
+    spans_h = y0 <= px and y1 >= height - 1 - px
+    return bool(spans_w and spans_h)
 
 
 def _right_angle_score(corners: np.ndarray) -> float:
@@ -213,6 +218,30 @@ def _edge_maps(gray: np.ndarray) -> list[np.ndarray]:
     mag = cv2.magnitude(gx, gy)
     maps.append((mag > 28).astype(np.uint8) * 255)
     return maps
+
+
+def _paper_mask(gray: np.ndarray) -> np.ndarray:
+    """Filled paper vs table using unnormalized gray.
+
+    Illumination normalization flattens page/table brightness, so Canny-only
+    search sees hollow outlines. A vertically clipped passport never closes.
+    Left/right border strips are used as the table reference (top/bottom may
+    be the document itself).
+    """
+    h, w = gray.shape[:2]
+    margin = max(6, w // 80)
+    table = np.concatenate(
+        [gray[:, :margin].reshape(-1), gray[:, w - margin :].reshape(-1)]
+    )
+    ref = float(np.median(table))
+    thr = ref + 28.0
+    mask = (gray.astype(np.float32) > thr).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+    # Join a dark fold a few pixels wide without bridging distant objects.
+    k_fold = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_fold, iterations=1)
+    return mask
 
 
 def _approx_quad(contour: np.ndarray, *, allow_min_rect: bool) -> tuple[np.ndarray | None, str, int]:
@@ -339,7 +368,7 @@ def _build_candidate(
     if conf < MIN_CONFIDENCE:
         _reject("below_geometry_confidence")
         return None
-    if _corner_on_border_count(corners, src_width, src_height, px=4.0) >= 3:
+    if _is_full_frame_quad(corners, src_width, src_height, px=4.0):
         _reject("frame_aligned")
         return None
     _emit(True, "")
@@ -366,10 +395,18 @@ def _candidate_from_contour(
     *,
     log_reject: bool = False,
     trace: object | None = None,
+    force_min_rect: bool = False,
+    area_from_hull: bool = False,
+    geometry_mode: str | None = None,
 ) -> QuadCandidate | None:
     fh, fw = int(work_shape[0]), int(work_shape[1])
     work_area = float(fh * fw)
     area = float(cv2.contourArea(contour))
+    if area_from_hull:
+        hull = cv2.convexHull(contour)
+        hull_area = float(cv2.contourArea(hull))
+        if hull_area > area:
+            area = hull_area
     area_frac = area / work_area if work_area else 0.0
 
     def _early(reason: str, *, corners_n: int = 0, bbox=None, aspect=0.0, rectangularity=0.0, right=0.0) -> None:
@@ -414,7 +451,7 @@ def _candidate_from_contour(
     if area_frac > MAX_AREA_FRACTION:
         _early("area_too_large")
         return None
-    allow_min_rect = 0.20 <= area_frac <= 0.85
+    allow_min_rect = force_min_rect or (0.20 <= area_frac <= 0.85)
     quad, mode, n_pts = _approx_quad(contour, allow_min_rect=allow_min_rect)
     if quad is None:
         _early(mode, corners_n=n_pts)
@@ -426,7 +463,10 @@ def _candidate_from_contour(
     rect = cv2.minAreaRect(contour)
     rw, rh = float(rect[1][0]), float(rect[1][1])
     min_rect_area = max(1.0, rw * rh)
-    geom_mode = "min_rect_fallback" if mode == "min_rect_fallback" else "quad"
+    if geometry_mode:
+        geom_mode = geometry_mode
+    else:
+        geom_mode = "min_rect_fallback" if mode == "min_rect_fallback" else "quad"
     cid = trace.next_id() if trace is not None else ""  # type: ignore[union-attr]
     return _build_candidate(
         order_corners(quad),
@@ -673,6 +713,29 @@ def find_document_quad(frame: np.ndarray, *, trace: object | None = None) -> tup
 
     for edge in _edge_maps(norm):
         _add_from_edges(edge, close_kernel=kernel, iterations=2)
+
+    paper = _paper_mask(work)
+    paper_contours, _ = cv2.findContours(paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in paper_contours:
+        cand = _candidate_from_contour(
+            contour,
+            work.shape,
+            scale,
+            src_w,
+            src_h,
+            log_reject=not candidates,
+            trace=trace,
+            force_min_rect=True,
+            area_from_hull=True,
+            geometry_mode="paper_region",
+        )
+        if cand is None:
+            continue
+        key = cand.bbox
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(cand)
 
     if candidates:
         if trace is not None:
