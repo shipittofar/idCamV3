@@ -594,7 +594,8 @@ class TestPhase2DFocusCaptureHandoff:
         await orch._capturing_tick()
         assert orch.sm.state != AppState.IMAGE_VALIDATION
         assert orch.sm.state != AppState.SUCCESS
-        assert orch.sm.state == AppState.RECOVERY
+        assert orch.sm.state == AppState.IDLE
+        assert orch._awaiting_clear_scene is True
 
     @pytest.mark.asyncio
     async def test_capture_time_geometry_movement_aborts(self, app_config):

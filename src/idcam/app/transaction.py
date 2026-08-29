@@ -54,6 +54,14 @@ class ActiveCaptureTransaction:
     focus_attempts: int = 0
     focus_verify_attempts: int = 0
     trigger: str = "auto"
+    applied_async_ops: set[str] = field(default_factory=set)
+
+    def try_consume_async(self, operation: str) -> bool:
+        """Return True once per operation name; later completions are stale."""
+        if operation in self.applied_async_ops:
+            return False
+        self.applied_async_ops.add(operation)
+        return True
 
     @staticmethod
     def generate_id() -> str:

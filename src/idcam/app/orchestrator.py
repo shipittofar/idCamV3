@@ -29,6 +29,7 @@ from idcam.exceptions import (
     ServerRejectedError,
     ServerError,
     ShutdownRequested,
+    StateMachineError,
 )
 from idcam.logging.setup import get_logger, set_log_context
 from idcam.network.api_client import ApiClient
@@ -136,6 +137,7 @@ class ApplicationOrchestrator:
         self._upload_result = ""
         self._last_capture_duration_ms = 0.0
         self._manual_capture_requested = False
+        self._stability_absent_count = 0
         self._logged_preview_rgb = False
         self._preview_tick_times: deque[float] = deque(maxlen=25)
         self._preview_tick_count = 0
@@ -311,7 +313,7 @@ class ApplicationOrchestrator:
             self._transition(AppState.WAITING_FOR_REMOVAL)
             return True
         if state == AppState.CAPTURING:
-            await self._enter_recovery("capture_timeout")
+            await self._fail_transaction_and_wait("still_capture_failed", "Capture timed out")
             return True
         if state == AppState.IMAGE_VALIDATION:
             await self._fail_transaction_and_wait("image_invalid", "Image validation timed out")
@@ -526,6 +528,11 @@ class ApplicationOrchestrator:
 
     def _begin_transaction(self, *, trigger: str = "auto") -> ActiveCaptureTransaction:
         if self._transaction is not None and not self._transaction.is_terminal:
+            logger.warning(
+                "event=capture_rejected reason=busy state=%s capture_id=%s",
+                self.sm.state.value,
+                self._transaction.capture_id,
+            )
             raise RuntimeError("Cannot begin transaction: one already active")
         if self.sm.state == AppState.WAITING_FOR_REMOVAL:
             self._resume_state = AppState.WAITING_FOR_REMOVAL
@@ -540,6 +547,7 @@ class ApplicationOrchestrator:
         txn = ActiveCaptureTransaction(capture_id=ActiveCaptureTransaction.generate_id(), trigger=trigger)
         txn.mark_document_detected()
         self._transaction = txn
+        self._stability_absent_count = 0
         self._capture_path = None
         self._idle_reject_count = 0
         self._capture_started = False
@@ -555,6 +563,11 @@ class ApplicationOrchestrator:
         txn_active = self._transaction is not None and not self._transaction.is_terminal
         allowed = {AppState.IDLE, AppState.WAITING_FOR_REMOVAL}
         if state not in allowed or self.has_active_transaction or txn_active:
+            logger.warning(
+                "event=capture_rejected reason=busy state=%s capture_id=%s",
+                state.value,
+                self._transaction.capture_id if self._transaction else None,
+            )
             logger.info("event=manual_capture_rejected status=busy state=%s", state.value)
             return {
                 "ok": False,
@@ -651,8 +664,19 @@ class ApplicationOrchestrator:
         self._publish_debug(frame)
         if not geom.present:
             self._log_geometry_status("geometry_absent", geom)
+            self._stability_absent_count += 1
+            required = self.config.detection.removal_frames_required
+            if self._stability_absent_count >= required:
+                logger.info(
+                    "event=document_absent_confirmed stage=waiting_for_stability frames=%d capture_id=%s",
+                    self._stability_absent_count,
+                    self._transaction.capture_id if self._transaction else None,
+                )
+                await self._fail_transaction_and_wait("document_absent", "Document removed before capture")
+                return
             self.sm.touch_progress()
             return
+        self._stability_absent_count = 0
         if ready:
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
@@ -716,6 +740,7 @@ class ApplicationOrchestrator:
             preview_roi,
         )
         min_sharp = self.config.quality.min_sharpness * 0.6
+        capture_id = self._transaction.capture_id
         try:
             result = await self.autofocus.run_autofocus(
                 self.camera,
@@ -724,6 +749,8 @@ class ApplicationOrchestrator:
                 preview_roi=preview_roi,
                 require_document_roi=require_document_roi,
             )
+            if self._stale_async_completion(capture_id, expected_state=AppState.FOCUSING, stage="autofocus"):
+                return
             if self._accepted_geometry is not None:
                 check_frame = await self._safe_preview()
                 if check_frame is not None:
@@ -756,9 +783,13 @@ class ApplicationOrchestrator:
             )
             self._transition(AppState.FOCUS_VERIFICATION, reason="autofocus_accepted")
         except AutofocusError as exc:
+            if self._stale_async_completion(
+                capture_id, expected_state=AppState.FOCUSING, stage="autofocus_error", consume=False
+            ):
+                return
             logger.error(
                 "event=autofocus_result capture_id=%s success=0 reason=%s error=%s",
-                self._transaction.capture_id,
+                capture_id,
                 getattr(exc, "reason", "focus_failed"),
                 exc,
             )
@@ -777,6 +808,7 @@ class ApplicationOrchestrator:
         if require_document_roi and preview_roi is None:
             await self._fail_transaction_and_wait("invalid_document_roi", "invalid_roi: no accepted document geometry")
             return
+        capture_id = self._transaction.capture_id
         try:
             result = await self.autofocus.verify_focus(
                 self.camera,
@@ -785,10 +817,21 @@ class ApplicationOrchestrator:
                 preview_roi=preview_roi,
                 require_document_roi=require_document_roi,
             )
+            if self._stale_async_completion(
+                capture_id, expected_state=AppState.FOCUS_VERIFICATION, stage="focus_verify"
+            ):
+                return
             self._transaction.mark_focus_completed(result.sharpness, result.min_required_sharpness)
             self.sm.touch_progress()
             self._transition(AppState.CAPTURING, reason="focus_verified")
         except AutofocusError as exc:
+            if self._stale_async_completion(
+                capture_id,
+                expected_state=AppState.FOCUS_VERIFICATION,
+                stage="focus_verify_error",
+                consume=False,
+            ):
+                return
             if self._transaction.focus_verify_attempts < self.config.camera.af_verify_max_retries:
                 self._transition(AppState.FOCUSING, reason="refocus")
             else:
@@ -832,8 +875,11 @@ class ApplicationOrchestrator:
         )
         logger.info("event=pipeline_stage stage=capturing path=%s", output_path)
         started = time.monotonic()
+        capture_id = self._transaction.capture_id
         try:
             self._capture_path = await self.capture_service.capture(self.camera, output_path)
+            if self._stale_async_completion(capture_id, expected_state=AppState.CAPTURING, stage="capture"):
+                return
             self._last_capture_duration_ms = (time.monotonic() - started) * 1000.0
             self.sm.touch_progress()
             logger.info(
@@ -844,15 +890,19 @@ class ApplicationOrchestrator:
             )
             self._transition(AppState.IMAGE_VALIDATION)
         except CaptureError as exc:
+            if self._stale_async_completion(
+                capture_id, expected_state=AppState.CAPTURING, stage="capture_error", consume=False
+            ):
+                return
             self._last_capture_duration_ms = (time.monotonic() - started) * 1000.0
             logger.error(
                 "event=capture_result event_alias=still_capture_failed capture_id=%s success=0 reason=%s duration_ms=%.0f",
-                self._transaction.capture_id,
+                capture_id,
                 exc,
                 self._last_capture_duration_ms,
             )
             self.temp_store.cleanup(output_path)
-            await self._enter_recovery(str(exc))
+            await self._fail_transaction_and_wait("still_capture_failed", str(exc))
 
     async def _validation_tick(self) -> None:
         if not self._claim_state_action():
@@ -872,6 +922,7 @@ class ApplicationOrchestrator:
                 scaler_crop = None
         require_roi = self._transaction.trigger == "auto" or self._accepted_geometry is not None
         started = time.monotonic()
+        capture_id = self._transaction.capture_id
         try:
             result = await asyncio.to_thread(
                 self.validator.validate,
@@ -882,6 +933,10 @@ class ApplicationOrchestrator:
                 preview_sharpness=self._transaction.sharpness_score,
                 require_document_roi=require_roi,
             )
+            if self._stale_async_completion(
+                capture_id, expected_state=AppState.IMAGE_VALIDATION, stage="image_validation"
+            ):
+                return
             validation_ms = (time.monotonic() - started) * 1000.0
             logger.info(
                 "event=image_validation_timing stage=validation_tick duration_ms=%.1f capture_id=%s",
@@ -914,9 +969,16 @@ class ApplicationOrchestrator:
             self.sm.touch_progress()
             self._transition(AppState.UPLOADING)
         except ImageValidationError as exc:
+            if self._stale_async_completion(
+                capture_id,
+                expected_state=AppState.IMAGE_VALIDATION,
+                stage="image_validation_error",
+                consume=False,
+            ):
+                return
             logger.error(
                 "event=capture_result capture_id=%s success=0 reason=validation_failure detail=%s",
-                self._transaction.capture_id,
+                capture_id,
                 exc,
             )
             logger.error("event=image_validation_failed %s", exc)
@@ -943,13 +1005,16 @@ class ApplicationOrchestrator:
             image_path=str(self._capture_path),
             created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
+        capture_id = self._transaction.capture_id
         try:
             logger.info(
                 "event=image_validation_timing stage=upload_start duration_ms=0 capture_id=%s",
-                self._transaction.capture_id,
+                capture_id,
             )
             upload_started = time.monotonic()
             self._pending_response = await self.api.upload_document(request)
+            if self._stale_async_completion(capture_id, expected_state=AppState.UPLOADING, stage="upload"):
+                return
             logger.info(
                 "event=image_validation_timing stage=upload duration_ms=%.1f capture_id=%s",
                 (time.monotonic() - upload_started) * 1000.0,
@@ -965,15 +1030,23 @@ class ApplicationOrchestrator:
             self.sm.touch_progress()
             self._transition(AppState.WAITING_FOR_SERVER, reason="upload_sent")
         except (ServerRejectedError, ServerError, ProtocolError) as exc:
+            if self._stale_async_completion(
+                capture_id, expected_state=AppState.UPLOADING, stage="upload_error", consume=False
+            ):
+                return
             self.temp_store.cleanup(self._capture_path)
             key = "server_rejected" if isinstance(exc, ServerRejectedError) else "upload_failed"
             self._upload_result = key
-            logger.error("event=api_upload_result capture_id=%s success=0 reason=%s", self._transaction.capture_id, key)
+            logger.error("event=api_upload_result capture_id=%s success=0 reason=%s", capture_id, key)
             await self._fail_transaction_and_wait(key, str(exc))
         except NetworkError as exc:
+            if self._stale_async_completion(
+                capture_id, expected_state=AppState.UPLOADING, stage="upload_error", consume=False
+            ):
+                return
             self.temp_store.cleanup(self._capture_path)
             self._upload_result = "upload_failed"
-            logger.error("event=api_upload_result capture_id=%s success=0 reason=upload_failed", self._transaction.capture_id)
+            logger.error("event=api_upload_result capture_id=%s success=0 reason=upload_failed", capture_id)
             await self._fail_transaction_and_wait("upload_failed", str(exc))
 
     async def _waiting_server_tick(self) -> None:
@@ -985,7 +1058,22 @@ class ApplicationOrchestrator:
         if not self._claim_state_action():
             return
         assert self._transaction is not None
+        capture_id = self._transaction.capture_id
         response = self._pending_response
+        if response is not None and response.capture_id and response.capture_id != capture_id:
+            logger.warning(
+                "event=stale_async_ignored operation=server_response capture_id=%s current_capture_id=%s "
+                "state=%s expected_state=%s",
+                response.capture_id,
+                capture_id,
+                self.sm.state.value,
+                AppState.PROCESSING_RESPONSE.value,
+            )
+            return
+        if self._stale_async_completion(
+            capture_id, expected_state=AppState.PROCESSING_RESPONSE, stage="server_response"
+        ):
+            return
         logger.info(
             "event=pipeline_stage stage=server_response success=%s outcome=%s http_status=%s capture_id=%s",
             bool(response and response.success),
@@ -998,6 +1086,7 @@ class ApplicationOrchestrator:
             self.health.server = ComponentStatus(level=HealthLevel.HEALTHY, details={"healthy": True, "reachable": True})
             self._transaction.mark_completed()
             self.temp_store.cleanup(self._capture_path)
+            logger.info("event=transaction_completed capture_id=%s", self._transaction.capture_id)
             logger.info("event=pipeline_stage stage=success capture_id=%s", self._transaction.capture_id)
             self._finish_manual_request(
                 {
@@ -1178,6 +1267,13 @@ class ApplicationOrchestrator:
             **self._health_status_kwargs(),
         )
         logger.info(
+            "event=transaction_failed reason=%s detail=%s capture_id=%s next_state=%s",
+            failure_key,
+            detail,
+            self._transaction.capture_id if self._transaction else None,
+            dest.value,
+        )
+        logger.info(
             "event=pipeline_stage stage=failed reason=%s detail=%s capture_id=%s next_state=%s",
             failure_key,
             detail,
@@ -1215,7 +1311,43 @@ class ApplicationOrchestrator:
         self._capture_path = None
         self._pending_response = None
         self._accepted_geometry = None
+        self._stability_absent_count = 0
         set_log_context(capture_id=None)
+
+    def _stale_async_completion(
+        self,
+        capture_id: str,
+        *,
+        expected_state: AppState,
+        stage: str,
+        consume: bool = True,
+    ) -> bool:
+        """True when an awaited result must not mutate a newer (or already ended) pipeline."""
+        txn = self._transaction
+        current_id = txn.capture_id if txn else None
+        if txn is None or current_id != capture_id or txn.is_terminal or self.sm.state != expected_state:
+            logger.warning(
+                "event=stale_async_ignored operation=%s capture_id=%s current_capture_id=%s "
+                "state=%s expected_state=%s",
+                stage,
+                capture_id,
+                current_id,
+                self.sm.state.value,
+                expected_state.value,
+            )
+            return True
+        if consume and not txn.try_consume_async(stage):
+            logger.warning(
+                "event=stale_async_ignored operation=%s capture_id=%s current_capture_id=%s "
+                "state=%s expected_state=%s",
+                stage,
+                capture_id,
+                current_id,
+                self.sm.state.value,
+                expected_state.value,
+            )
+            return True
+        return False
 
     def _refresh_health(self) -> None:
         storage = self.disk.check()
@@ -1247,16 +1379,29 @@ class ApplicationOrchestrator:
         if self._shutdown_event.is_set() and target not in {AppState.SHUTDOWN, AppState.RECOVERY}:
             target = AppState.SHUTDOWN
         prev = self.sm.state
+        if not self.sm.can_transition(target):
+            logger.warning(
+                "event=state_transition_rejected from_state=%s to_state=%s reason=%s capture_id=%s",
+                prev.value,
+                target.value,
+                reason,
+                self._transaction.capture_id if self._transaction else None,
+            )
+            raise StateMachineError(
+                f"Invalid transition {prev.value} -> {target.value}" + (f": {reason}" if reason else "")
+            )
         self._last_transition_reason = reason or f"{prev.value}->{target.value}"
         self.sm.transition(target, reason=reason)
         self._state_action_claimed = None
+        if self._transaction is not None:
+            self._transaction.applied_async_ops.clear()
         if target != AppState.ERROR:
             self._error_backoff_claimed = False
         set_log_context(state=target.value)
         geom = self.detector.last_geometry()
         stab = self.geometry_stability.debug_info()
         logger.info(
-            "event=state_transition from=%s to=%s reason=%s capture_id=%s "
+            "event=state_transition from_state=%s to_state=%s reason=%s capture_id=%s "
             "document_detected=%s geometry_reason=%s confidence=%.3f bbox=%s "
             "stable=%s stable_count=%d displacement_px=%.2f removal_detected=%s removal_count=%d",
             prev.value,
