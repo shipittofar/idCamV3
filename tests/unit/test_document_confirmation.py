@@ -1,4 +1,4 @@
-"""Document confirmation gate: reject empty scenes, keep off-center/rotated pages."""
+"""Document confirmation metrics (not an auto-capture gate)."""
 
 from __future__ import annotations
 
@@ -143,10 +143,10 @@ def _full_frame_rect(shape=(480, 640)) -> np.ndarray:
     return img
 
 
-def _rejected() -> DocumentConfirmation:
+def _rejected(reason: str = "insufficient_combined_evidence") -> DocumentConfirmation:
     return DocumentConfirmation(
         accepted=False,
-        reason="insufficient_combined_evidence",
+        reason=reason,
         candidate_present=True,
         evidence_edge_support=0.0,
         evidence_edge_sides=1,
@@ -178,6 +178,21 @@ async def _idle_until_auto(orch, ticks=16):
         if orch.sm.state == AppState.DOCUMENT_DETECTED:
             return
     raise AssertionError(f"auto transaction did not start; state={orch.sm.state}")
+
+
+async def _assert_auto_if_geometry(orch, frame, app_config):
+    present = DocumentDetector(app_config.detection).detect_geometry(frame).present
+    orch._safe_preview = AsyncMock(return_value=frame)
+    if present:
+        await _idle_until_auto(orch)
+        assert orch._transaction is not None
+        assert orch._transaction.trigger == "auto"
+        assert orch._transaction.document_confirmed is True
+        return
+    for _ in range(12):
+        await orch._idle_tick()
+    assert orch.sm.state == AppState.IDLE
+    assert orch._transaction is None
 
 
 class TestGeometryGatesUnchanged:
@@ -325,12 +340,12 @@ class TestAutoCaptureGuards:
         assert orch._transaction is None
 
     @pytest.mark.asyncio
-    async def test_geometry_present_without_confirmation_skips_af(self, app_config):
+    async def test_confirmation_reject_does_not_block_auto_capture(self, app_config):
         orch = _orch(app_config)
         orch.sm.state = AppState.IDLE
         page = _id_card()
         assert DocumentDetector(app_config.detection).detect_geometry(page).present
-        rejected = _rejected()
+        rejected = _rejected("insufficient_edge_support")
         orch._safe_preview = AsyncMock(return_value=page)
 
         def reject_update(_frame, geom):
@@ -339,20 +354,94 @@ class TestAutoCaptureGuards:
             return rejected
 
         orch.document_confirmation.update = reject_update
-        for _ in range(8):
-            await orch._idle_tick()
-        assert orch.sm.state == AppState.IDLE
-        assert orch._transaction is None
+        orch.document_confirmation.last = rejected
+        await _idle_until_auto(orch)
+        assert orch._transaction is not None
+        assert orch._transaction.trigger == "auto"
+        assert orch.document_confirmation.last.accepted is False
+
+    @pytest.mark.asyncio
+    async def test_border_occlusion_confirmation_does_not_block_auto(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        page = _id_card(box=(0, 40, 420, 320), printed=True)
+        orch._safe_preview = AsyncMock(return_value=page)
+        orch.document_confirmation.last = _rejected("border_occlusion")
+        await _idle_until_auto(orch)
+        assert orch._transaction.trigger == "auto"
 
     @pytest.mark.asyncio
     async def test_centered_id_starts_auto_path(self, app_config):
         orch = _orch(app_config)
         orch.sm.state = AppState.IDLE
-        orch._safe_preview = AsyncMock(return_value=_id_card())
-        await _idle_until_auto(orch)
-        assert orch._transaction is not None
-        assert orch._transaction.trigger == "auto"
-        assert orch._transaction.document_confirmed is True
+        await _assert_auto_if_geometry(orch, _id_card(), app_config)
+
+    @pytest.mark.asyncio
+    async def test_left_id_starts_auto_path(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(box=(8, 100, 260, 170), printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_right_id_starts_auto_path(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(box=(360, 100, 260, 170), printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_top_id_starts_auto_path(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(box=(160, 8, 300, 160), printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_bottom_id_starts_auto_path(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(box=(160, 300, 300, 160), printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_corner_id_starts_auto_path(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(box=(8, 8, 240, 150), printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_rotated_id_starts_auto_path(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(angle=20, printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_strongly_rotated_id_starts_auto_if_geometry(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(angle=45, printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_large_id_starts_auto_path(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(box=(8, 8, 620, 460), printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_small_id_starts_auto_if_geometry(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        await _assert_auto_if_geometry(orch, _id_card(box=(220, 180, 180, 120), printed=True), app_config)
+
+    @pytest.mark.asyncio
+    async def test_partial_off_frame_starts_auto_if_geometry(self, app_config):
+        orch = _orch(app_config)
+        orch.sm.state = AppState.IDLE
+        img = _wood_table((480, 640))
+        img[40:400, 0:360] = (242, 238, 230)
+        img[40:43, 0:360] = 35
+        img[397:400, 0:360] = 35
+        img[40:400, 357:360] = 35
+        for row in range(56, 384, 12):
+            img[row : row + 2, 20:340] = (30, 30, 36)
+        await _assert_auto_if_geometry(orch, img, app_config)
 
     @pytest.mark.asyncio
     async def test_off_center_id_starts_auto_path(self, app_config):

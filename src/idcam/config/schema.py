@@ -195,7 +195,7 @@ class DebugConfig(BaseModel):
     port: int = Field(8088, ge=1024, le=65535)
     fps: float = Field(5.0, gt=0, le=15)
     jpeg_quality: int = Field(70, ge=30, le=100)
-    max_width: int = Field(1280, ge=320, le=3840)
+    max_width: int = Field(1920, ge=320, le=3840)
     overlay: bool = True
 
     @field_validator("host")

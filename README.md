@@ -155,7 +155,7 @@ debug:
   port: 8088
   fps: 5.0
   jpeg_quality: 70
-  max_width: 1280
+  max_width: 1920
   overlay: true
 ```
 

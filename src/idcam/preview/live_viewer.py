@@ -26,8 +26,8 @@ from idcam.logging.setup import get_logger
 logger = get_logger("preview.live_viewer")
 
 MJPEG_BOUNDARY = "frame"
-PLACEHOLDER_WIDTH = 1280
-PLACEHOLDER_HEIGHT = 720
+PLACEHOLDER_WIDTH = 1920
+PLACEHOLDER_HEIGHT = 1080
 _MAX_CLIENT_LOGS_PER_MINUTE = 20
 
 
@@ -308,7 +308,7 @@ def compose_debug_frame(
     """Draw overlay in ``frame`` preview coordinates, then shrink for MJPEG.
 
     Document/focus ROIs are preview pixels of ``frame``. Draw first, then resize,
-    so a 1920-space box is not painted onto a 1280-wide image.
+    so a 1920-space box is not painted onto a narrower JPEG.
     """
     if overlay:
         image = draw_overlay(frame, snapshot, fps)
@@ -361,7 +361,8 @@ _HTML_PAGE = """<!DOCTYPE html>
     h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
     .note { color: #aaa; font-size: 0.85rem; margin-top: 4px; }
     main { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px; }
-    img { width: 100%; max-width: 1280px; background: #000; border: 1px solid #333; }
+    img { width: auto; max-width: min(100%, 1920px); height: auto; object-fit: contain;
+           background: #000; border: 1px solid #333; }
     dl { margin: 0; }
     dt { color: #888; font-size: 0.75rem; text-transform: uppercase; margin-top: 12px; }
     dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; font-size: 1.05rem; }

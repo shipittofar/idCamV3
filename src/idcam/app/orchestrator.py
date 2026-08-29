@@ -42,7 +42,7 @@ from idcam.storage.temp_files import TempFileStore
 from idcam.system.component_health import ComponentStatus, HealthLevel, SystemHealth
 from idcam.system.watchdog import Watchdog
 from idcam.ui.status import StatusPublisher
-from idcam.vision.document_confirmation import DocumentConfirmationTracker, confirm_document
+from idcam.vision.document_confirmation import DocumentConfirmationTracker
 from idcam.vision.document_detector import DocumentDetector, DocumentGeometryResult
 from idcam.vision.geometry import find_document_quad
 from idcam.vision.geometry_stability import GeometryStability, mean_corner_displacement_px
@@ -415,21 +415,20 @@ class ApplicationOrchestrator:
         return self.detector.document_preview_roi(frame)
 
     def _observe_geometry(self, frame) -> tuple[DocumentGeometryResult, bool]:
-        """Geometry candidate + stability. Confirmation is a separate eligibility gate."""
+        """Geometry candidate + temporal stability. Confirmation does not gate auto-capture."""
         geom = self.detector.detect_geometry(frame)
         ready = self.geometry_stability.update(geom)
-        self.document_confirmation.update(frame, geom)
         return geom, ready
 
     def _auto_document_ready(self, geom: DocumentGeometryResult, geometry_ready: bool) -> bool:
-        return bool(
-            geom.present
-            and geometry_ready
-            and self.document_confirmation.temporally_confirmed
-        )
+        return bool(geom.present and geometry_ready)
 
-    def _confirmation_holds(self) -> bool:
-        return bool(self.document_confirmation.last.accepted)
+    def _preview_candidate_usable(self, frame) -> bool:
+        """True if the preview still has a geometry candidate (not a semantic classifier)."""
+        if frame is None:
+            return False
+        raw, _count = find_document_quad(frame)
+        return raw is not None
 
     def _geometry_moved_readonly(self, frame) -> tuple[bool, float]:
         """Capture-time jitter vs accepted READY corners. Does not mutate detector state."""
@@ -518,18 +517,17 @@ class ApplicationOrchestrator:
             return
         geom, ready = self._observe_geometry(frame)
         present = geom.present
-        confirmed_now = self._confirmation_holds()
-        self._last_scene_empty = not confirmed_now
+        self._last_scene_empty = not present
         self._publish_debug(frame)
-        if self._awaiting_clear_scene and not confirmed_now:
+        if self._awaiting_clear_scene and not present:
             self._clear_scene_count += 1
-            self._log_geometry_status("geometry_absent" if not present else "document_unconfirmed", geom)
+            self._log_geometry_status("geometry_absent", geom)
             if self._clear_scene_count >= self.config.detection.removal_frames_required:
                 self._awaiting_clear_scene = False
                 self._clear_scene_count = 0
                 logger.info("event=auto_capture_armed reason=geometry_absent_after_failure")
             return
-        if self._awaiting_clear_scene and confirmed_now:
+        if self._awaiting_clear_scene and present:
             self._clear_scene_count = 0
             self._log_geometry_status("auto_rearm_blocked", geom)
             return
@@ -544,9 +542,6 @@ class ApplicationOrchestrator:
             logger.info("event=pipeline_stage stage=document_detected")
             self._begin_transaction(trigger="auto")
             self._transition(AppState.DOCUMENT_DETECTED, reason="document_detected")
-            return
-        if present and ready and not self.document_confirmation.temporally_confirmed:
-            self._log_geometry_status("geometry_stable_unconfirmed", geom)
             return
         if present:
             status = "geometry_held" if geom.reason == "geometry_held" else "geometry_unstable"
@@ -576,10 +571,10 @@ class ApplicationOrchestrator:
         txn = ActiveCaptureTransaction(capture_id=ActiveCaptureTransaction.generate_id(), trigger=trigger)
         txn.mark_document_detected()
         if trigger == "auto":
-            conf = self.document_confirmation.last
+            last = self.detector.last_geometry()
             txn.document_confirmed = True
-            txn.confirmed_geometry_mode = conf.geometry_mode
-            txn.confirmed_roi = conf.roi if conf.roi != (0, 0, 0, 0) else None
+            txn.confirmed_geometry_mode = last.geometry_mode
+            txn.confirmed_roi = last.bbox if last.bbox != (0, 0, 0, 0) else None
         self._transaction = txn
         self._stability_absent_count = 0
         self._capture_path = None
@@ -712,12 +707,8 @@ class ApplicationOrchestrator:
                 return
             self.sm.touch_progress()
             return
-        if not self._confirmation_holds():
-            self._log_geometry_status("document_unconfirmed", geom)
-            self.sm.touch_progress()
-            return
         self._stability_absent_count = 0
-        if ready and self.document_confirmation.temporally_confirmed:
+        if ready:
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
                 "event=document_ready capture_id=%s reason=%s confidence=%.3f bbox=%s "
@@ -758,14 +749,13 @@ class ApplicationOrchestrator:
         if frame is None:
             return
         auto = self._transaction.trigger == "auto"
-        if auto and self._accepted_geometry is not None:
-            if not confirm_document(frame, self._accepted_geometry).accepted:
-                logger.warning(
-                    "event=document_confirmation result=rejected reason=pre_af_recheck capture_id=%s",
-                    self._transaction.capture_id,
-                )
-                await self._fail_transaction_and_wait("document_absent", "Document confirmation failed before autofocus")
-                return
+        if auto and not self._preview_candidate_usable(frame):
+            logger.warning(
+                "event=document_absent reason=pre_af_recheck capture_id=%s",
+                self._transaction.capture_id,
+            )
+            await self._fail_transaction_and_wait("document_absent", "Document candidate gone before autofocus")
+            return
         preview_roi = self._accepted_preview_roi(frame, allow_search_fallback=not auto)
         require_document_roi = auto or self._accepted_geometry is not None
         if require_document_roi and preview_roi is None:
@@ -908,12 +898,12 @@ class ApplicationOrchestrator:
             return
         if self._transaction.trigger == "auto":
             preview = await self._safe_preview()
-            if preview is None or not confirm_document(preview, self._accepted_geometry).accepted:
+            if preview is None or not self._preview_candidate_usable(preview):
                 logger.warning(
-                    "event=document_confirmation result=rejected reason=pre_capture_recheck capture_id=%s",
+                    "event=document_absent reason=pre_capture_recheck capture_id=%s",
                     self._transaction.capture_id,
                 )
-                await self._fail_transaction_and_wait("document_absent", "Document confirmation failed before capture")
+                await self._fail_transaction_and_wait("document_absent", "Document candidate gone before capture")
                 return
         if not await self._check_motion_abort():
             return
@@ -1189,11 +1179,11 @@ class ApplicationOrchestrator:
             self._transition(AppState.DOCUMENT_DETECTED, reason="manual_capture")
             return
         geom, _ready = self._observe_geometry(frame)
-        empty = not self._confirmation_holds()
+        empty = not geom.present
         self._last_scene_empty = empty
         if empty:
             self._removal_count += 1
-            self._log_geometry_status("geometry_absent" if not geom.present else "document_unconfirmed", geom)
+            self._log_geometry_status("geometry_absent", geom)
         else:
             self._removal_count = 0
             self._log_geometry_status("geometry_present", geom)
@@ -1508,20 +1498,19 @@ class ApplicationOrchestrator:
         available, phase, message = self._manual_status()
         af = self.autofocus.debug
         bbox = geom.bbox if geom.present and geom.bbox is not None else (0, 0, 0, 0)
-        conf = self.document_confirmation.last
         viewer.publish(
             frame,
             state=self.sm.state.value,
             document_detected=geom.present,
             geometry_candidate=geom.present,
-            document_confirmed=conf.accepted,
-            confirmation_reason=conf.reason,
-            evidence_edge_support=conf.evidence_edge_support,
-            evidence_edge_sides=conf.evidence_edge_sides,
-            evidence_paper_contrast=conf.evidence_paper_contrast,
-            evidence_print=conf.evidence_print,
-            evidence_line_structure=conf.evidence_line_structure,
-            evidence_fold=conf.evidence_fold,
+            document_confirmed=geom.present,
+            confirmation_reason="geometry_gate" if geom.present else (geom.reason or "no_candidate"),
+            evidence_edge_support=0.0,
+            evidence_edge_sides=0,
+            evidence_paper_contrast=0.0,
+            evidence_print=0.0,
+            evidence_line_structure=0.0,
+            evidence_fold=0.0,
             motion=doc.motion,
             edge_density=doc.edge_density,
             motion_threshold=doc.motion_threshold,

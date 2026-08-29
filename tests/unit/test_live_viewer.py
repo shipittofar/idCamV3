@@ -257,6 +257,16 @@ class TestOverlayResizeUsesPreviewCoordinates:
         assert at_raw[2] > at_scaled[2] + 40
 
 
+    def test_compose_keeps_full_1920_frame_when_max_width_is_1920(self):
+        frame = np.full((self._SRC_H, self._SRC_W, 3), 18, dtype=np.uint8)
+        snap = self._snapshot()
+        composed = compose_debug_frame(frame, snap, fps=5.0, max_width=1920, overlay=True)
+        assert composed.shape[1] == 1920
+        assert composed.shape[0] == 1080
+        at_bl = self._window_mean(composed, self._ROI[0], self._ROI[1] + self._ROI[3])
+        assert at_bl[2] > 70
+
+
 class TestDebugHttp:
     def test_status_json_and_no_secrets(self, debug_viewer):
         debug_viewer.publish(

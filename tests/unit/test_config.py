@@ -103,7 +103,7 @@ class TestDebugConfig:
         assert config.debug.port == 8088
         assert config.debug.fps == 5.0
         assert config.debug.jpeg_quality == 70
-        assert config.debug.max_width == 1280
+        assert config.debug.max_width == 1920
         assert config.debug.overlay is True
 
     def test_valid_debug_section(self, valid_config_dict):

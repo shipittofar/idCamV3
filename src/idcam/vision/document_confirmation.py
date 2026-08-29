@@ -1,8 +1,8 @@
-"""Candidate-relative document confirmation (not center-ROI, not OCR).
+"""Optional candidate-relative document evidence (debug / offline analysis).
 
-Geometry may propose a quadrilateral. Auto-capture must not start unless this
-module agrees the quadrilateral behaves like a document against the current
-preview pixels.
+Auto-capture is gated by geometry + GeometryStability only. This module is not
+a hard auto-capture blocker. ``confirm_document`` remains available for debug
+scripts and unit tests of evidence metrics.
 
 All measurements are taken in the candidate's own polygon, anywhere in frame.
 """
