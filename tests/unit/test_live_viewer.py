@@ -449,6 +449,64 @@ class TestDebugHttp:
         assert "Bearer" not in dumped
         assert "token" not in payload
 
+    def test_html_includes_manual_focus_controls(self, debug_viewer):
+        url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/live"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            html = resp.read().decode("utf-8")
+        assert "SET MANUAL" in html
+        assert "SCAN FOCUS" in html
+        assert "CAPTURE FOCUS TEST" in html
+        assert "/preview/focus" in html
+
+    def test_focus_post_unavailable_without_handler(self, debug_viewer):
+        url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/focus"
+        req = urllib.request.Request(
+            url, data=b'{"action":"manual"}', method="POST", headers={"Content-Type": "application/json"}
+        )
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            urllib.request.urlopen(req, timeout=3)
+        assert excinfo.value.code == 503
+
+    def test_focus_post_nudge_and_clamp(self, debug_viewer, tmp_path):
+        from idcam.camera.manager import CameraManager
+        from idcam.config.schema import CameraConfig
+        from idcam.preview.manual_focus import ManualFocusCalibrator
+
+        cam = CameraManager(
+            CameraConfig(preview_width=320, preview_height=240, capture_width=640, capture_height=480),
+            use_mock=True,
+        )
+        cam.initialize()
+        frame = np.full((240, 320, 3), 190, dtype=np.uint8)
+        cal = ManualFocusCalibrator(
+            camera=cam,
+            get_preview=lambda: frame,
+            get_document=lambda: (False, None),
+            still_dir=tmp_path / "focus_debug",
+        )
+        debug_viewer.set_focus_handler(cal.handle)
+        url = f"http://127.0.0.1:{debug_viewer.config.port}/preview/focus"
+        req = urllib.request.Request(
+            url,
+            data=b'{"action":"set","lens":7.8}',
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["ok"] is True
+        assert abs(float(payload["requested_lens"]) - 7.8) < 1e-6
+        req2 = urllib.request.Request(
+            url,
+            data=b'{"action":"set","lens":50}',
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req2, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert float(payload["requested_lens"]) == 10.0
+        assert float(payload["actual_lens"]) == 10.0
+
 
 class TestDetectorFrameIsolation:
     def test_overlay_does_not_change_detector_result(self):

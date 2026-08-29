@@ -268,6 +268,9 @@ class CameraManager:
         self._still_config: Any = None
         self._logged_preview_format = False
         self._preview_af_mode: str | None = None
+        self._mock_af_mode = 1
+        self._mock_lens = 1.0
+        self._mock_fom = 26.0
 
     @property
     def is_mock(self) -> bool:
@@ -381,7 +384,7 @@ class CameraManager:
                 self._logged_preview_format = True
             return frame
 
-    def capture_still_to_file(self, path: Path) -> None:
+    def capture_still_to_file(self, path: Path, *, restore_preview_af: bool = True) -> None:
         """Capture one full-resolution JPEG to ``path``.
 
         The encoder format is always passed explicitly, so ``path`` may carry
@@ -427,7 +430,15 @@ class CameraManager:
                     self._picam2.configure(self._preview_config)
                     self._picam2.start()
                     try:
-                        self._enable_preview_autofocus(wait=False)
+                        if restore_preview_af:
+                            self._enable_preview_autofocus(wait=False)
+                        elif lens_position is not None:
+                            self._set_controls_unlocked(
+                                {
+                                    "AfMode": self._af_mode_manual(),
+                                    "LensPosition": float(lens_position),
+                                }
+                            )
                     except Exception as exc:
                         logger.warning("event=autofocus_preview_failed error=%s", exc)
                 except Exception as exc:
@@ -453,11 +464,40 @@ class CameraManager:
             assert self._picam2 is not None
             return dict(self._picam2.camera_controls)
 
+    def lens_position_limits(self) -> tuple[float, float]:
+        info = self.get_controls().get("LensPosition")
+        try:
+            lo, hi = float(info[0]), float(info[1])  # type: ignore[index]
+            if hi < lo:
+                lo, hi = hi, lo
+            return lo, hi
+        except (TypeError, ValueError, IndexError):
+            return 0.0, 10.0
+
+    def set_manual_lens(self, lens_position: float) -> float:
+        """AfMode=Manual and an explicit LensPosition, clamped to advertised limits."""
+        lo, hi = self.lens_position_limits()
+        requested = min(hi, max(lo, float(lens_position)))
+        with self._lock:
+            self._set_controls_unlocked(
+                {"AfMode": self._af_mode_manual(), "LensPosition": requested}
+            )
+            if self._use_mock:
+                return float(self._mock_lens)
+            actual = self._read_lens_position()
+            return float(actual) if actual is not None else requested
+
     def capture_metadata(self) -> dict[str, Any]:
         """Return live per-frame metadata (AfState, LensPosition, etc.)."""
         with self._lock:
             if self._use_mock:
-                return {"AfMode": 1, "AfState": 2, "AfTrigger": 0, "LensPosition": 1.0}
+                return {
+                    "AfMode": int(self._mock_af_mode),
+                    "AfState": 0 if int(self._mock_af_mode) == 0 else 2,
+                    "AfTrigger": 0,
+                    "LensPosition": float(self._mock_lens),
+                    "FocusFoM": float(self._mock_fom),
+                }
             assert self._picam2 is not None
             return dict(self._picam2.capture_metadata())
 
@@ -467,6 +507,17 @@ class CameraManager:
 
     def _set_controls_unlocked(self, control_dict: dict[str, Any]) -> None:
         if self._use_mock:
+            if "AfMode" in control_dict:
+                try:
+                    self._mock_af_mode = int(control_dict["AfMode"])
+                except (TypeError, ValueError):
+                    pass
+            if "LensPosition" in control_dict:
+                try:
+                    lo, hi = self.lens_position_limits()
+                    self._mock_lens = min(hi, max(lo, float(control_dict["LensPosition"])))
+                except (TypeError, ValueError):
+                    pass
             return
         assert self._picam2 is not None
         advertised = set(self._picam2.camera_controls.keys())
@@ -739,8 +790,8 @@ class CameraManager:
     def wait_for_lens_settle(self, timeout_sec: float) -> float | None:
         """Wait until LensPosition stops changing. Used when AfState is unavailable."""
         if self._use_mock:
-            time.sleep(0.05)
-            return 1.0
+            time.sleep(0.01)
+            return float(self._mock_lens)
         deadline = time.monotonic() + max(0.4, float(timeout_sec))
         # Hardware AF often sits Idle ~0.3–0.4s after AfTrigger before the lens moves.
         time.sleep(0.35)
@@ -778,6 +829,8 @@ class CameraManager:
         """Lock the current lens position so Continuous AF does not hunt during still capture."""
         with self._lock:
             if self._use_mock or self._picam2 is None:
+                if self._use_mock:
+                    self._mock_af_mode = int(self._af_mode_manual())
                 return
             advertised = self._picam2.camera_controls
             if "AfPause" in advertised:
@@ -835,6 +888,8 @@ class CameraManager:
             return self._af_mode_continuous()
 
     def _read_lens_position(self) -> float | None:
+        if self._use_mock:
+            return float(self._mock_lens)
         if self._picam2 is None:
             return None
         try:

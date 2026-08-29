@@ -35,6 +35,7 @@ from idcam.logging.setup import get_logger, set_log_context
 from idcam.network.api_client import ApiClient
 from idcam.network.protocol import UploadOutcome, UploadRequest
 from idcam.preview.live_viewer import LiveDebugViewer
+from idcam.preview.manual_focus import ManualFocusCalibrator
 from idcam.storage.disk_monitor import DiskMonitor, StorageHealth
 from idcam.storage.paths import ensure_writable_directory
 from idcam.storage.temp_files import TempFileStore
@@ -118,6 +119,7 @@ class ApplicationOrchestrator:
         self._capture_path: Path | None = None
         self._pending_response = None
         self._debug_viewer: LiveDebugViewer | None = None
+        self._manual_focus = None
         self._idle_reject_count = 0
         self._last_geometry_status = ""
         self._accepted_geometry: DocumentGeometryResult | None = None
@@ -146,6 +148,13 @@ class ApplicationOrchestrator:
         if config.debug.enabled:
             self._debug_viewer = LiveDebugViewer(config.debug)
             self._debug_viewer.set_capture_handler(self.request_manual_capture)
+            self._manual_focus = ManualFocusCalibrator(
+                camera=self.camera,
+                get_preview=self._preview_for_focus_debug,
+                get_document=self._document_for_focus_debug,
+                still_dir=config.temp_dir / "focus_debug",
+            )
+            self._debug_viewer.set_focus_handler(self._manual_focus.handle)
 
     @property
     def has_active_transaction(self) -> bool:
@@ -1498,6 +1507,20 @@ class ApplicationOrchestrator:
             detect_hz=self._last_detect_hz,
             tick_ms=self._last_tick_ms,
         )
+        if self._manual_focus is not None:
+            try:
+                viewer.apply_focus_debug(self._manual_focus.observe(frame))
+            except Exception:
+                logger.debug("event=manual_focus_observe_failed", exc_info=True)
+
+    def _preview_for_focus_debug(self):
+        if self._debug_viewer is not None:
+            return self._debug_viewer.latest_frame_copy()
+        return None
+
+    def _document_for_focus_debug(self):
+        geom = self.detector.last_geometry()
+        return bool(geom.present), geom.bbox
 
     async def _shutdown(self) -> None:
         self._transition(AppState.SHUTDOWN)

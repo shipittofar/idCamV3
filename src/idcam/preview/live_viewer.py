@@ -86,6 +86,17 @@ class DebugSnapshot:
     upload_result: str = ""
     detect_hz: float = 0.0
     tick_ms: float = 0.0
+    focus_mode: str = ""
+    requested_lens: float | None = None
+    actual_lens: float | None = None
+    af_state_name: str = ""
+    focus_fom: float | None = None
+    document_sharpness: float | None = None
+    focus_roi_source: str = ""
+    focus_roi_live: str = ""
+    lens_min: float | None = None
+    lens_max: float | None = None
+    focus_message: str = ""
 
 
 class LiveFrameBuffer:
@@ -210,6 +221,10 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
     if doc_roi is not None:
         dx, dy, dw, dh = doc_roi
         cv2.rectangle(debug_frame, (dx, dy), (dx + dw, dy + dh), (80, 180, 255), 2)
+    focus_live = _parse_roi(snapshot.focus_roi_live)
+    if focus_live is not None:
+        fx, fy, fw, fh = focus_live
+        cv2.rectangle(debug_frame, (fx, fy), (fx + fw, fy + fh), (255, 200, 40), 2)
 
     camera = "OK" if snapshot.camera_healthy else "ERROR"
     if not snapshot.camera_healthy and snapshot.waiting_for_camera and not snapshot.camera_error:
@@ -245,6 +260,21 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
         f"DETECT Hz: {snapshot.detect_hz:.1f}  TICK: {snapshot.tick_ms:.0f}ms",
         f"CAMERA: {camera}",
     ]
+    if snapshot.focus_mode:
+        lens = snapshot.actual_lens
+        req = snapshot.requested_lens
+        lines = [
+            "FOCUS DEBUG",
+            f"Mode: {snapshot.focus_mode.upper()}",
+            f"Requested: {'—' if req is None else f'{req:.3f}'}",
+            f"Lens: {'—' if lens is None else f'{lens:.3f}'}",
+            f"AfState: {snapshot.af_state_name or '—'}",
+            f"FocusFoM: {'—' if snapshot.focus_fom is None else f'{snapshot.focus_fom:.0f}'}",
+            f"Document Sharpness: {'—' if snapshot.document_sharpness is None else f'{snapshot.document_sharpness:.1f}'}",
+            f"Focus ROI: {snapshot.focus_roi_live or '—'}",
+            f"Focus ROI source: {snapshot.focus_roi_source or '—'}",
+            f"Lens range: {snapshot.lens_min}..{snapshot.lens_max}",
+        ] + lines
     if snapshot.camera_error and not snapshot.camera_healthy:
         err = snapshot.camera_error.replace("\n", " ")[:60]
         lines.append(f"DETAIL: {err}")
@@ -326,6 +356,11 @@ _HTML_PAGE = """<!DOCTYPE html>
       background: #3b82f6; color: #fff;
     }
     button:disabled { background: #334155; color: #94a3b8; cursor: not-allowed; }
+    .focus-box { margin-top: 18px; padding-top: 12px; border-top: 1px solid #333; }
+    .focus-box h2 { margin: 0 0 8px; font-size: 0.85rem; letter-spacing: 0.04em; color: #fbbf24; }
+    .focus-row { display: flex; gap: 6px; margin: 6px 0; }
+    .focus-row button { margin-top: 0; padding: 8px 6px; font-size: 0.85rem; background: #334155; }
+    .keys { color: #888; font-size: 0.75rem; margin-top: 8px; line-height: 1.4; }
     .manual { margin-top: 8px; font-size: 0.9rem; color: #ddd; min-height: 2.4em; }
     .manual.error { color: #f87171; }
     .manual.ok { color: #4ade80; }
@@ -371,6 +406,44 @@ _HTML_PAGE = """<!DOCTYPE html>
       </dl>
       <button id="capture" type="button">Capture &amp; Send</button>
       <div id="manual" class="manual">Idle</div>
+      <div class="focus-box">
+        <h2>Manual focus (debug)</h2>
+        <dt style="display:none"></dt>
+        <div>Mode: <span id="fmode">—</span></div>
+        <div>Requested: <span id="freq">—</span></div>
+        <div>Lens: <span id="flens">—</span></div>
+        <div>AfState: <span id="fstate">—</span></div>
+        <div>FocusFoM: <span id="ffom">—</span></div>
+        <div>Doc sharpness: <span id="fsharp">—</span></div>
+        <div>Focus ROI: <span id="froi">—</span></div>
+        <div>ROI source: <span id="froisrc">—</span></div>
+        <div>Range: <span id="frange">—</span></div>
+        <div class="focus-row">
+          <button type="button" data-focus='{"action":"nudge","delta":-1}'>-1.0</button>
+          <button type="button" data-focus='{"action":"nudge","delta":-0.1}'>-0.1</button>
+          <button type="button" data-focus='{"action":"nudge","delta":-0.01}'>-0.01</button>
+        </div>
+        <div class="focus-row">
+          <button type="button" data-focus='{"action":"nudge","delta":0.01}'>+0.01</button>
+          <button type="button" data-focus='{"action":"nudge","delta":0.1}'>+0.1</button>
+          <button type="button" data-focus='{"action":"nudge","delta":1}'>+1.0</button>
+        </div>
+        <div class="focus-row">
+          <button type="button" data-focus='{"action":"manual"}'>SET MANUAL</button>
+        </div>
+        <div class="focus-row">
+          <button type="button" data-focus='{"action":"autofocus"}'>AUTOFOCUS</button>
+          <button type="button" data-focus='{"action":"lock"}'>LOCK</button>
+        </div>
+        <div class="focus-row">
+          <button type="button" data-focus='{"action":"scan","step":0.2}'>SCAN FOCUS</button>
+        </div>
+        <div class="focus-row">
+          <button type="button" data-focus='{"action":"capture_test"}'>CAPTURE FOCUS TEST</button>
+        </div>
+        <div id="focusmsg" class="manual"></div>
+        <div class="keys">←/→ ±0.01 · Shift+arrows ±0.1 · M manual · A AF · L lock · S scan · T still test</div>
+      </div>
     </aside>
   </main>
   <script>
@@ -427,6 +500,20 @@ _HTML_PAGE = """<!DOCTYPE html>
         el("tickms").textContent = Number(d.tick_ms || 0).toFixed(0);
         const ts = d.timestamp ? new Date(d.timestamp * 1000).toISOString() : "—";
         el("timestamp").textContent = ts;
+        const fd = d.focus || {};
+        el("fmode").textContent = fd.focus_mode || "—";
+        el("freq").textContent = fd.requested_lens == null ? "—" : Number(fd.requested_lens).toFixed(3);
+        el("flens").textContent = fd.actual_lens == null ? "—" : Number(fd.actual_lens).toFixed(3);
+        el("fstate").textContent = fd.af_state_name || "—";
+        el("ffom").textContent = fd.focus_fom == null ? "—" : Number(fd.focus_fom).toFixed(0);
+        el("fsharp").textContent = fd.document_sharpness == null ? "—" : Number(fd.document_sharpness).toFixed(1);
+        el("froi").textContent = fd.focus_roi || "—";
+        el("froisrc").textContent = fd.focus_roi_source || "—";
+        el("frange").textContent = (fd.lens_min == null ? "—" : Number(fd.lens_min).toFixed(2)) + " .. " + (fd.lens_max == null ? "—" : Number(fd.lens_max).toFixed(2));
+        if (!window._focusBusy) {
+          const fm = el("focusmsg");
+          fm.textContent = fd.message || "";
+        }
         const btn = el("capture");
         btn.disabled = capturing || d.manual_capture_available === false;
         const box = el("manual");
@@ -469,6 +556,43 @@ _HTML_PAGE = """<!DOCTYPE html>
         refresh();
       }
     });
+    async function postFocus(body) {
+      window._focusBusy = true;
+      const fm = el("focusmsg");
+      fm.className = "manual";
+      fm.textContent = "Working...";
+      try {
+        const r = await fetch("/preview/focus", {
+          method: "POST",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const d = await r.json();
+        fm.className = d.ok ? "manual ok" : "manual error";
+        fm.textContent = d.message || d.status || (d.ok ? "OK" : "Failed");
+        refresh();
+      } catch (err) {
+        fm.className = "manual error";
+        fm.textContent = "Focus request failed";
+      } finally {
+        window._focusBusy = false;
+      }
+    }
+    document.querySelectorAll("[data-focus]").forEach((btn) => {
+      btn.addEventListener("click", () => postFocus(JSON.parse(btn.getAttribute("data-focus"))));
+    });
+    window.addEventListener("keydown", (ev) => {
+      if (ev.target && (ev.target.tagName === "INPUT" || ev.target.tagName === "TEXTAREA")) return;
+      const k = ev.key;
+      if (k === "ArrowLeft") { ev.preventDefault(); postFocus({ action: "nudge", delta: ev.shiftKey ? -0.1 : -0.01 }); }
+      else if (k === "ArrowRight") { ev.preventDefault(); postFocus({ action: "nudge", delta: ev.shiftKey ? 0.1 : 0.01 }); }
+      else if (k === "a" || k === "A") postFocus({ action: "autofocus" });
+      else if (k === "l" || k === "L") postFocus({ action: "lock" });
+      else if (k === "m" || k === "M") postFocus({ action: "manual" });
+      else if (k === "s" || k === "S") postFocus({ action: "scan", step: 0.2 });
+      else if (k === "t" || k === "T") postFocus({ action: "capture_test" });
+    });
     refresh();
     setInterval(refresh, 500);
   </script>
@@ -499,6 +623,8 @@ def _make_handler(viewer: LiveDebugViewer) -> type[BaseHTTPRequestHandler]:
             path = urlparse(self.path).path
             if path == "/preview/capture":
                 self._serve_capture()
+            elif path == "/preview/focus":
+                self._serve_focus()
             else:
                 self.send_error(404, "Not Found")
 
@@ -549,6 +675,70 @@ def _make_handler(viewer: LiveDebugViewer) -> type[BaseHTTPRequestHandler]:
             elif safe["status"] == "timeout":
                 code = 504
             elif not safe["ok"] and safe["status"] not in {"failed"}:
+                code = 500
+            self._json_bytes(safe, code)
+
+        def _serve_focus(self) -> None:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = b"{}"
+            if length > 0:
+                raw = self.rfile.read(min(length, 65536))
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            action = str(payload.get("action") or "status")
+            handler = viewer.focus_handler
+            if handler is None:
+                self._json_bytes(
+                    {"ok": False, "status": "unavailable", "message": "Manual focus is not attached"},
+                    503,
+                )
+                return
+            try:
+                result = handler(action, payload)
+            except Exception:
+                logger.exception("event=debug_manual_focus_failed")
+                self._json_bytes(
+                    {"ok": False, "status": "error", "message": "Focus request failed"},
+                    500,
+                )
+                return
+            if not isinstance(result, dict):
+                self._json_bytes({"ok": False, "status": "error", "message": "Invalid focus result"}, 500)
+                return
+            allowed = {
+                "ok",
+                "status",
+                "message",
+                "focus_mode",
+                "requested_lens",
+                "actual_lens",
+                "af_state",
+                "af_state_name",
+                "af_mode",
+                "focus_fom",
+                "document_sharpness",
+                "focus_roi",
+                "focus_roi_source",
+                "lens_min",
+                "lens_max",
+                "busy",
+                "scan",
+                "capture_test",
+                "settle_duration_ms",
+            }
+            safe = {k: result[k] for k in allowed if k in result}
+            if "ok" not in safe:
+                safe["ok"] = bool(result.get("ok"))
+            code = 200
+            if result.get("status") == "busy":
+                code = 409
+            elif result.get("status") == "unavailable":
+                code = 503
+            elif not safe.get("ok") and result.get("status") == "error":
                 code = 500
             self._json_bytes(safe, code)
 
@@ -632,6 +822,7 @@ class LiveDebugViewer:
         self._frame_info: dict[str, Any] | None = None
         self._logged_encode_format = False
         self._capture_handler: Any = None
+        self._focus_handler: Any = None
 
     @property
     def is_running(self) -> bool:
@@ -643,6 +834,28 @@ class LiveDebugViewer:
 
     def set_capture_handler(self, handler: Any) -> None:
         self._capture_handler = handler
+
+    @property
+    def focus_handler(self) -> Any:
+        return self._focus_handler
+
+    def set_focus_handler(self, handler: Any) -> None:
+        self._focus_handler = handler
+
+    def apply_focus_debug(self, data: dict[str, Any]) -> None:
+        with self._meta_lock:
+            snap = self._snapshot
+            snap.focus_mode = str(data.get("focus_mode") or "")
+            snap.requested_lens = data.get("requested_lens")
+            snap.actual_lens = data.get("actual_lens")
+            snap.af_state_name = str(data.get("af_state_name") or "")
+            snap.focus_fom = data.get("focus_fom")
+            snap.document_sharpness = data.get("document_sharpness")
+            snap.focus_roi_source = str(data.get("focus_roi_source") or "")
+            snap.focus_roi_live = str(data.get("focus_roi") or "")
+            snap.lens_min = data.get("lens_min")
+            snap.lens_max = data.get("lens_max")
+            snap.focus_message = str(data.get("message") or "")
 
     def start(self) -> None:
         if self._started:
@@ -763,6 +976,7 @@ class LiveDebugViewer:
     ) -> None:
         """Store the latest preview copy and metadata. Never blocks on HTTP clients."""
         with self._meta_lock:
+            prev = self._snapshot
             if frame is not None:
                 self._latest_frame = frame.copy()
                 self._frame_seq += 1
@@ -824,6 +1038,17 @@ class LiveDebugViewer:
                 upload_result=upload_result,
                 detect_hz=detect_hz,
                 tick_ms=tick_ms,
+                focus_mode=prev.focus_mode,
+                requested_lens=prev.requested_lens,
+                actual_lens=prev.actual_lens,
+                af_state_name=prev.af_state_name,
+                focus_fom=prev.focus_fom,
+                document_sharpness=prev.document_sharpness,
+                focus_roi_source=prev.focus_roi_source,
+                focus_roi_live=prev.focus_roi_live,
+                lens_min=prev.lens_min,
+                lens_max=prev.lens_max,
+                focus_message=prev.focus_message,
             )
 
     def snapshot_meta(self) -> DebugSnapshot:
@@ -892,6 +1117,19 @@ class LiveDebugViewer:
             "capture_started": snap.capture_started,
             "upload_started": snap.upload_started,
             "upload_result": snap.upload_result,
+            "focus": {
+                "focus_mode": snap.focus_mode,
+                "requested_lens": snap.requested_lens,
+                "actual_lens": snap.actual_lens,
+                "af_state_name": snap.af_state_name,
+                "focus_fom": snap.focus_fom,
+                "document_sharpness": snap.document_sharpness,
+                "focus_roi": snap.focus_roi_live,
+                "focus_roi_source": snap.focus_roi_source,
+                "lens_min": snap.lens_min,
+                "lens_max": snap.lens_max,
+                "message": snap.focus_message,
+            },
         }
 
     def wait_jpeg(self, last_seq: int, timeout: float) -> tuple[int, bytes | None]:
