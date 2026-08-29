@@ -215,20 +215,22 @@ def _edge_maps(gray: np.ndarray) -> list[np.ndarray]:
     return maps
 
 
-def _approx_quad(contour: np.ndarray, *, allow_min_rect: bool) -> tuple[np.ndarray | None, str]:
+def _approx_quad(contour: np.ndarray, *, allow_min_rect: bool) -> tuple[np.ndarray | None, str, int]:
     hull = cv2.convexHull(contour)
     peri = cv2.arcLength(hull, True)
     if peri < 8:
-        return None, "perimeter_too_small"
+        return None, "perimeter_too_small", 0
+    n_pts = 0
     for eps in (0.02, 0.03, 0.04, 0.055, 0.07):
         approx = cv2.approxPolyDP(hull, eps * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.float32), "quad"
+        n_pts = int(len(approx))
+        if n_pts == 4:
+            return approx.reshape(4, 2).astype(np.float32), "quad", 4
     if allow_min_rect:
         rect = cv2.minAreaRect(contour)
         box = cv2.boxPoints(rect).astype(np.float32)
-        return box, "min_rect_fallback"
-    return None, "not_quadrilateral"
+        return box, "min_rect_fallback", 4
+    return None, "not_quadrilateral", n_pts
 
 
 def _maybe_log_reject(
@@ -273,6 +275,8 @@ def _build_candidate(
     geometry_mode: str,
     *,
     log_reject: bool,
+    trace: object | None = None,
+    candidate_id: str = "",
 ) -> QuadCandidate | None:
     corners_work = order_corners(corners_work)
     conf, area_ratio, aspect, rectangularity = score_quad(
@@ -283,9 +287,10 @@ def _build_candidate(
     corners = clip_corners(corners, src_width, src_height)
     bbox = bbox_from_corners(corners)
     border = _border_distance(corners, src_width, src_height)
+    cid = candidate_id or (trace.next_id() if trace is not None else "")  # type: ignore[union-attr]
 
-    def _reject(reason: str) -> None:
-        if log_reject:
+    def _emit(accepted: bool, reason: str) -> None:
+        if log_reject and not accepted:
             _maybe_log_reject(
                 reason=reason,
                 area_ratio=area_ratio,
@@ -296,6 +301,31 @@ def _build_candidate(
                 right_angle=right,
                 border_distance=border,
             )
+        if trace is None:
+            return
+        rec = {
+            "candidate_id": cid,
+            "bbox": bbox,
+            "x": bbox[0],
+            "y": bbox[1],
+            "width": bbox[2],
+            "height": bbox[3],
+            "area": float(contour_area),
+            "area_ratio": area_ratio,
+            "aspect_ratio": aspect,
+            "rectangularity": rectangularity,
+            "corner_count": 4,
+            "confidence": conf,
+            "border_distance": border,
+            "rejection_reason": "" if accepted else reason,
+            "accepted": accepted,
+            "geometry_mode": geometry_mode,
+            "candidate_edge_score": right,
+        }
+        trace.record_candidate(rec)  # type: ignore[union-attr]
+
+    def _reject(reason: str) -> None:
+        _emit(False, reason)
 
     if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
         _reject("aspect_out_of_range")
@@ -312,6 +342,7 @@ def _build_candidate(
     if _corner_on_border_count(corners, src_width, src_height, px=4.0) >= 3:
         _reject("frame_aligned")
         return None
+    _emit(True, "")
     return QuadCandidate(
         corners=corners,
         bbox=bbox,
@@ -334,59 +365,69 @@ def _candidate_from_contour(
     src_height: int,
     *,
     log_reject: bool = False,
+    trace: object | None = None,
 ) -> QuadCandidate | None:
     fh, fw = int(work_shape[0]), int(work_shape[1])
     work_area = float(fh * fw)
     area = float(cv2.contourArea(contour))
     area_frac = area / work_area if work_area else 0.0
-    if area_frac < MIN_AREA_FRACTION:
+
+    def _early(reason: str, *, corners_n: int = 0, bbox=None, aspect=0.0, rectangularity=0.0, right=0.0) -> None:
         if log_reject:
             _maybe_log_reject(
-                reason="area_too_small",
+                reason=reason,
                 area_ratio=area_frac,
-                bbox=None,
-                aspect_ratio=0.0,
-                rectangularity=0.0,
-                corner_count=0,
-                right_angle=0.0,
+                bbox=bbox,
+                aspect_ratio=aspect,
+                rectangularity=rectangularity,
+                corner_count=corners_n,
+                right_angle=right,
                 border_distance=0.0,
             )
+        if trace is None or area_frac < 0.04:
+            return
+        cid = trace.next_id()  # type: ignore[union-attr]
+        rec = {
+            "candidate_id": cid,
+            "bbox": bbox,
+            "x": None if bbox is None else bbox[0],
+            "y": None if bbox is None else bbox[1],
+            "width": None if bbox is None else bbox[2],
+            "height": None if bbox is None else bbox[3],
+            "area": area,
+            "area_ratio": area_frac,
+            "aspect_ratio": aspect,
+            "rectangularity": rectangularity,
+            "corner_count": corners_n,
+            "confidence": 0.0,
+            "border_distance": 0.0,
+            "rejection_reason": reason,
+            "accepted": False,
+            "geometry_mode": "",
+            "candidate_edge_score": right,
+        }
+        trace.record_candidate(rec)  # type: ignore[union-attr]
+
+    if area_frac < MIN_AREA_FRACTION:
+        _early("area_too_small")
         return None
     if area_frac > MAX_AREA_FRACTION:
-        if log_reject:
-            _maybe_log_reject(
-                reason="area_too_large",
-                area_ratio=area_frac,
-                bbox=None,
-                aspect_ratio=0.0,
-                rectangularity=0.0,
-                corner_count=0,
-                right_angle=0.0,
-                border_distance=0.0,
-            )
+        _early("area_too_large")
         return None
     allow_min_rect = 0.20 <= area_frac <= 0.85
-    quad, mode = _approx_quad(contour, allow_min_rect=allow_min_rect)
+    quad, mode, n_pts = _approx_quad(contour, allow_min_rect=allow_min_rect)
     if quad is None:
-        if log_reject:
-            _maybe_log_reject(
-                reason=mode,
-                area_ratio=area_frac,
-                bbox=None,
-                aspect_ratio=0.0,
-                rectangularity=0.0,
-                corner_count=0,
-                right_angle=0.0,
-                border_distance=0.0,
-            )
+        _early(mode, corners_n=n_pts)
         return None
     hull_quad = cv2.convexHull(quad.astype(np.float32))
     if len(hull_quad) != 4:
+        _early("hull_not_quad", corners_n=int(len(hull_quad)))
         return None
     rect = cv2.minAreaRect(contour)
     rw, rh = float(rect[1][0]), float(rect[1][1])
     min_rect_area = max(1.0, rw * rh)
     geom_mode = "min_rect_fallback" if mode == "min_rect_fallback" else "quad"
+    cid = trace.next_id() if trace is not None else ""  # type: ignore[union-attr]
     return _build_candidate(
         order_corners(quad),
         area,
@@ -397,6 +438,8 @@ def _candidate_from_contour(
         src_height,
         geom_mode,
         log_reject=log_reject,
+        trace=trace,
+        candidate_id=cid,
     )
 
 
@@ -410,7 +453,7 @@ def _bbox_containment_frac(inner: tuple[int, int, int, int], outer: tuple[int, i
     return float(inter) / float(inner_area)
 
 
-def _suppress_inner_quads(candidates: list[QuadCandidate]) -> list[QuadCandidate]:
+def _suppress_inner_quads(candidates: list[QuadCandidate], trace: object | None = None) -> list[QuadCandidate]:
     """Prefer the outer document boundary over text blocks and single pages inside it."""
     if len(candidates) < 2:
         return candidates
@@ -424,6 +467,10 @@ def _suppress_inner_quads(candidates: list[QuadCandidate]) -> list[QuadCandidate
             if _bbox_containment_frac(inner.bbox, outer.bbox) >= 0.88:
                 keep[i] = False
                 break
+    if trace is not None:
+        for c, ok in zip(candidates, keep):
+            if not ok:
+                trace.suppressed.append(trace.id_for(c.bbox))  # type: ignore[union-attr]
     return [c for c, ok in zip(candidates, keep) if ok]
 
 
@@ -434,21 +481,51 @@ def _try_merge_two_page(
     scale: float,
     src_width: int,
     src_height: int,
+    trace: object | None = None,
+    id_a: str = "",
+    id_b: str = "",
 ) -> QuadCandidate | None:
     left, right = (a, b) if a.bbox[0] <= b.bbox[0] else (b, a)
+    if a.bbox[0] <= b.bbox[0]:
+        id_left, id_right = id_a, id_b
+    else:
+        id_left, id_right = id_b, id_a
     lx, ly, lw, lh = left.bbox
     rx, ry, rw, rh = right.bbox
     height_ratio = min(lh, rh) / max(lh, rh)
-    if height_ratio < MERGE_MIN_HEIGHT_RATIO:
-        return None
     y0, y1 = max(ly, ry), min(ly + lh, ry + rh)
     overlap_h = max(0, y1 - y0)
-    if overlap_h / min(lh, rh) < MERGE_MIN_VERTICAL_OVERLAP:
-        return None
+    vert_overlap = overlap_h / min(lh, rh) if min(lh, rh) else 0.0
     gap = rx - (lx + lw)
+    ux, uy = min(lx, rx), min(ly, ry)
+    combined = (ux, uy, max(lx + lw, rx + rw) - ux, max(ly + lh, ry + rh) - uy)
     max_gap = MERGE_MAX_GAP_FRAC * min(lw, rw)
     min_gap = MERGE_MIN_GAP_FRAC * min(lw, rw)
+
+    def _merge_fail(reason: str, *, score: float = 0.0) -> None:
+        if trace is None:
+            return
+        trace.merges.append(  # type: ignore[union-attr]
+            {
+                "candidate_a": id_left,
+                "candidate_b": id_right,
+                "horizontal_gap": gap,
+                "vertical_overlap": vert_overlap,
+                "height_ratio": height_ratio,
+                "combined_bbox": combined,
+                "merge_score": score,
+                "merge_rejection_reason": reason,
+            }
+        )
+
+    if height_ratio < MERGE_MIN_HEIGHT_RATIO:
+        _merge_fail("height_ratio")
+        return None
+    if vert_overlap < MERGE_MIN_VERTICAL_OVERLAP:
+        _merge_fail("vertical_overlap")
+        return None
     if gap > max_gap or gap < min_gap:
+        _merge_fail("horizontal_gap")
         return None
     lc = order_corners(left.corners)
     rc = order_corners(right.corners)
@@ -457,16 +534,18 @@ def _try_merge_two_page(
     frame_area = float(max(src_width * src_height, 1))
     poly_area = float(cv2.contourArea(merged.astype(np.float32)))
     if poly_area / frame_area < MERGE_MIN_AREA:
+        _merge_fail("combined_area")
         return None
     aspect = _aspect_of_quad(merged)
     if aspect < MERGE_MIN_ASPECT or aspect > MERGE_MAX_ASPECT:
+        _merge_fail("combined_aspect")
         return None
     rect = cv2.minAreaRect(merged.astype(np.float32))
     rw_r, rh_r = float(rect[1][0]), float(rect[1][1])
     min_rect_area_src = max(1.0, rw_r * rh_r)
     work_corners = merged * float(scale)
     work_area_px = poly_area * (scale * scale)
-    return _build_candidate(
+    cand = _build_candidate(
         work_corners,
         work_area_px,
         work_area,
@@ -476,7 +555,25 @@ def _try_merge_two_page(
         src_height,
         "merged_two_page",
         log_reject=False,
+        trace=trace,
     )
+    if cand is None:
+        _merge_fail("merge_geometry_rejected")
+        return None
+    if trace is not None:
+        trace.merges.append(  # type: ignore[union-attr]
+            {
+                "candidate_a": id_left,
+                "candidate_b": id_right,
+                "horizontal_gap": gap,
+                "vertical_overlap": vert_overlap,
+                "height_ratio": height_ratio,
+                "combined_bbox": cand.bbox,
+                "merge_score": cand.confidence,
+                "merge_rejection_reason": "",
+            }
+        )
+    return cand
 
 
 def _merge_two_page_candidates(
@@ -485,13 +582,24 @@ def _merge_two_page_candidates(
     scale: float,
     src_width: int,
     src_height: int,
+    trace: object | None = None,
 ) -> list[QuadCandidate]:
     extra: list[QuadCandidate] = []
     n = len(candidates)
     for i in range(n):
         for j in range(i + 1, n):
+            id_a = trace.id_for(candidates[i].bbox) if trace is not None else ""  # type: ignore[union-attr]
+            id_b = trace.id_for(candidates[j].bbox) if trace is not None else ""  # type: ignore[union-attr]
             merged = _try_merge_two_page(
-                candidates[i], candidates[j], work_area, scale, src_width, src_height
+                candidates[i],
+                candidates[j],
+                work_area,
+                scale,
+                src_width,
+                src_height,
+                trace=trace,
+                id_a=id_a,
+                id_b=id_b,
             )
             if merged is not None:
                 extra.append(merged)
@@ -507,10 +615,11 @@ def _rank_key(cand: QuadCandidate) -> tuple[float, float]:
     return (cand.confidence + booklet - flush, cand.border_distance)
 
 
-def find_document_quad(frame: np.ndarray) -> tuple[QuadCandidate | None, int]:
+def find_document_quad(frame: np.ndarray, *, trace: object | None = None) -> tuple[QuadCandidate | None, int]:
     """Return the best document-like quadrilateral in ``frame`` pixel space.
 
     ``frame`` is RGB or gray. The input array is not written.
+    ``trace`` is optional diagnostics only; it does not change accept/reject rules.
     """
     if frame.ndim == 3:
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY if frame.shape[2] == 3 else cv2.COLOR_RGBA2GRAY)
@@ -536,13 +645,23 @@ def find_document_quad(frame: np.ndarray) -> tuple[QuadCandidate | None, int]:
     candidates: list[QuadCandidate] = []
     seen: set[tuple[int, int, int, int]] = set()
     work_area = float(work.shape[0] * work.shape[1])
+    if trace is not None:
+        trace.src_wh = (src_w, src_h)  # type: ignore[union-attr]
+        trace.work_wh = (int(work.shape[1]), int(work.shape[0]))  # type: ignore[union-attr]
+        trace.scale = float(scale)  # type: ignore[union-attr]
 
     def _add_from_edges(edge: np.ndarray, *, close_kernel, iterations: int) -> None:
         closed = cv2.morphologyEx(edge, cv2.MORPH_CLOSE, close_kernel, iterations=iterations)
         contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             cand = _candidate_from_contour(
-                contour, work.shape, scale, src_w, src_h, log_reject=not candidates
+                contour,
+                work.shape,
+                scale,
+                src_w,
+                src_h,
+                log_reject=not candidates,
+                trace=trace,
             )
             if cand is None:
                 continue
@@ -556,8 +675,12 @@ def find_document_quad(frame: np.ndarray) -> tuple[QuadCandidate | None, int]:
         _add_from_edges(edge, close_kernel=kernel, iterations=2)
 
     if candidates:
-        candidates = _merge_two_page_candidates(candidates, work_area, scale, src_w, src_h)
-        candidates = _suppress_inner_quads(candidates)
+        if trace is not None:
+            trace.accepted_before_merge = len(candidates)  # type: ignore[union-attr]
+        candidates = _merge_two_page_candidates(
+            candidates, work_area, scale, src_w, src_h, trace=trace
+        )
+        candidates = _suppress_inner_quads(candidates, trace=trace)
 
     if not candidates:
         return None, 0

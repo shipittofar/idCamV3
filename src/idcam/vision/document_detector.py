@@ -15,6 +15,7 @@ from idcam.vision.geometry import (
     find_document_quad,
     order_corners,
 )
+from idcam.vision.geometry_debug import maybe_persist_from_detector
 from idcam.vision.sharpness import clip_roi
 
 logger = get_logger("vision.document_detector")
@@ -214,6 +215,7 @@ class DocumentDetector:
                     *bbox,
                     result.corners,
                 )
+            maybe_persist_from_detector(frame, result, self)
             return result
 
         self._geom_misses += 1
@@ -234,6 +236,7 @@ class DocumentDetector:
                 geometry_mode=self._last_geometry.geometry_mode,
             )
             self._last_geometry = result
+            maybe_persist_from_detector(frame, result, self)
             return result
 
         self._geom_corners = None
@@ -254,6 +257,7 @@ class DocumentDetector:
                 self._geom_misses,
             )
         self._last_geometry = result
+        maybe_persist_from_detector(frame, result, self)
         return result
 
     def last_geometry(self) -> DocumentGeometryResult:
