@@ -33,9 +33,29 @@ def geometry_debug_dir() -> Path:
     return Path(os.environ.get("TMP", os.environ.get("TEMP", "/tmp")))
 
 
+def effective_resolution_chain(frame_width: int = 1920, frame_height: int = 1080) -> dict[str, Any]:
+    """Preview → geometry work → confirmation work (no 64MP still)."""
+    from idcam.vision import document_confirmation as confirm
+
+    gw = min(int(frame_width), int(geom.WORKING_WIDTH))
+    gh = max(1, int(round(frame_height * (gw / float(max(frame_width, 1))))))
+    cw = min(int(frame_width), int(confirm.CONFIRM_WORKING_WIDTH))
+    ch = max(1, int(round(frame_height * (cw / float(max(frame_width, 1))))))
+    return {
+        "camera_preview": f"{frame_width}x{frame_height}",
+        "geometry_working": f"{gw}x{gh}",
+        "geometry_working_width": geom.WORKING_WIDTH,
+        "geometry_refine_width": geom.WORKING_WIDTH_REFINE,
+        "confirmation_working": f"{cw}x{ch}",
+        "confirmation_working_width": confirm.CONFIRM_WORKING_WIDTH,
+        "note": "corners mapped back to preview pixels; debug JPEG is the preview array, not a second decode",
+    }
+
+
 def effective_geometry_config() -> dict[str, Any]:
     return {
         "WORKING_WIDTH": geom.WORKING_WIDTH,
+        "WORKING_WIDTH_REFINE": geom.WORKING_WIDTH_REFINE,
         "MIN_AREA_FRACTION": geom.MIN_AREA_FRACTION,
         "MAX_AREA_FRACTION": geom.MAX_AREA_FRACTION,
         "MIN_ASPECT": geom.MIN_ASPECT,

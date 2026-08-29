@@ -20,7 +20,8 @@ from idcam.vision.geometry import _fold_evidence, _is_full_frame_quad, order_cor
 
 logger = get_logger("vision.document_confirmation")
 
-CONFIRM_WORKING_WIDTH = 640
+# Match geometry working width so confirmation does not re-blur 1920→640.
+CONFIRM_WORKING_WIDTH = 1280
 BOOKLET_MODES = frozenset({"merged_two_page", "large_document_outer"})
 
 _MIN_SIDE_ON = 14.0
@@ -28,6 +29,8 @@ _MIN_SIDE_DELTA_OUT = 6.0
 _MIN_SIDE_DELTA_IN = 3.0
 _MIN_SIDES_NORMAL = 3
 _MIN_SIDES_BOOKLET = 2
+_TWO_SIDE_MEAN_SCORE = 0.28
+_MIN_BAND_SAMPLES = 5
 _MIN_PAPER_DELTA = 16.0
 _MIN_PAPER_DELTA_BOOKLET = 12.0
 _MIN_PAPER_NORM = 0.18
@@ -55,6 +58,17 @@ class DocumentConfirmation:
     geometry_mode: str
     geometry_aspect: float
     geometry_area_fraction: float
+    edge_support_top: float = 0.0
+    edge_support_right: float = 0.0
+    edge_support_bottom: float = 0.0
+    edge_support_left: float = 0.0
+    edge_support_mean: float = 0.0
+    edge_support_min: float = 0.0
+    working_width: int = 0
+    working_height: int = 0
+    edge_band_width_px: float = 0.0
+    edge_band_inner_offset_px: float = 0.0
+    edge_band_outer_offset_px: float = 0.0
 
 
 def _empty_confirmation(
@@ -112,12 +126,26 @@ def _prepare(gray: np.ndarray, corners: np.ndarray) -> tuple[np.ndarray, np.ndar
     if w <= CONFIRM_WORKING_WIDTH:
         return gray, pts, 1.0
     scale = CONFIRM_WORKING_WIDTH / float(w)
+    # LINEAR keeps Sobel peaks; AREA at 1920→640 was anti-aliasing the boundary away.
+    interp = cv2.INTER_AREA if scale <= 0.5 else cv2.INTER_LINEAR
     work = cv2.resize(
         gray,
         (CONFIRM_WORKING_WIDTH, max(1, int(round(h * scale)))),
-        interpolation=cv2.INTER_AREA,
+        interpolation=interp,
     )
     return work, (pts * scale).astype(np.float32), scale
+
+
+def _median_valid(image: np.ndarray, points: np.ndarray) -> tuple[float | None, int]:
+    """Median of in-frame samples only. Does not clip OOB points onto the border."""
+    h, w = image.shape[:2]
+    valid = (points[:, 0] >= 0) & (points[:, 0] < w) & (points[:, 1] >= 0) & (points[:, 1] < h)
+    n = int(np.count_nonzero(valid))
+    if n < _MIN_BAND_SAMPLES:
+        return None, n
+    xs = np.clip(np.rint(points[valid, 0]).astype(np.int32), 0, w - 1)
+    ys = np.clip(np.rint(points[valid, 1]).astype(np.int32), 0, h - 1)
+    return float(np.median(image[ys, xs].astype(np.float32))), n
 
 
 def _sobel_mag(gray: np.ndarray) -> np.ndarray:
@@ -134,57 +162,99 @@ def _sample_at(image: np.ndarray, points: np.ndarray) -> np.ndarray:
     return image[ys, xs].astype(np.float32)
 
 
-def _side_edge_scores(mag: np.ndarray, corners: np.ndarray) -> tuple[list[float], int, float]:
-    """Per-side localized edge near the proposed polygon (not axis-aligned).
+@dataclass
+class EdgeBandResult:
+    scores: list[float]
+    supported: int
+    mean: float
+    band_width: float
+    inner_offset: float
+    outer_offset: float
+    side_lengths: list[float]
 
-    Geometry quads (especially minAreaRect / paper_region) can sit a few pixels
-    inside the true ink/paper boundary. Search a short normal band for the
-    strongest edge, then compare that peak to farther inside/outside samples.
+
+def _side_edge_scores(mag: np.ndarray, corners: np.ndarray) -> EdgeBandResult:
+    """Per-side localized *boundary* support (not generic texture energy).
+
+    For each ordered side: tangent along the edge, inward/outward normals.
+    Peak Sobel in a size-adaptive normal band vs farther interior and exterior.
+    Missing exterior samples (frame border) are omitted, not treated as zero energy.
+    Corner thirds are skipped (t in 0.15–0.85).
     """
-    h, w = mag.shape[:2]
     pts = order_corners(corners)
     side_scores: list[float] = []
+    lengths: list[float] = []
     supported = 0
-    samples = 16
+    samples = 20
+    near_acc: list[float] = []
+    far_acc: list[float] = []
     for i in range(4):
         a, b = pts[i], pts[(i + 1) % 4]
         edge = b - a
         length = float(np.linalg.norm(edge))
+        lengths.append(length)
         if length < 8.0:
             side_scores.append(0.0)
             continue
         inward = np.array([-edge[1], edge[0]], dtype=np.float32) / length
         outward = -inward
-        near = float(np.clip(0.04 * length, 3.0, 16.0))
-        far = float(np.clip(0.09 * length, 8.0, 32.0))
-        ts = np.linspace(0.12, 0.88, samples, dtype=np.float32)
+        near = float(np.clip(0.03 * length, 4.0, 16.0))
+        h_m, w_m = mag.shape[:2]
+        far_cap = min(22.0, 0.08 * float(min(h_m, w_m)), 0.18 * length)
+        far = float(np.clip(max(0.06 * length, 1.6 * near), 8.0, max(8.0, far_cap)))
+        near_acc.append(near)
+        far_acc.append(far)
+        ts = np.linspace(0.15, 0.85, samples, dtype=np.float32)
         on_pts = a[None, :] + ts[:, None] * edge[None, :]
         peak = 0.0
-        span = int(round(near))
+        span = max(1, int(round(near)))
         for delta in range(-span, span + 1, 1):
             band = on_pts + outward[None, :] * float(delta)
-            valid = (band[:, 0] >= 0) & (band[:, 0] < w) & (band[:, 1] >= 0) & (band[:, 1] < h)
-            if int(np.count_nonzero(valid)) >= 6:
-                peak = max(peak, float(np.median(_sample_at(mag, band[valid]))))
-        out_pts = on_pts + outward[None, :] * far
-        in_pts = on_pts + inward[None, :] * far
-        out_valid = (out_pts[:, 0] >= 0) & (out_pts[:, 0] < w) & (out_pts[:, 1] >= 0) & (out_pts[:, 1] < h)
-        in_valid = (in_pts[:, 0] >= 0) & (in_pts[:, 0] < w) & (in_pts[:, 1] >= 0) & (in_pts[:, 1] < h)
-        out_v = float(np.median(_sample_at(mag, out_pts[out_valid]))) if np.any(out_valid) else 0.0
-        in_v = float(np.median(_sample_at(mag, in_pts[in_valid]))) if np.any(in_valid) else 0.0
-        ok = peak >= _MIN_SIDE_ON and (peak - out_v) >= _MIN_SIDE_DELTA_OUT and (peak - in_v) >= _MIN_SIDE_DELTA_IN
+            med, _n = _median_valid(mag, band)
+            if med is not None:
+                peak = max(peak, med)
+        out_v, n_out = _median_valid(mag, on_pts + outward[None, :] * far)
+        in_v, n_in = _median_valid(mag, on_pts + inward[None, :] * far)
+        out_ok = out_v is not None
+        in_ok = in_v is not None
         score = 0.0
-        if ok:
-            score = float(np.clip(0.5 * ((peak - out_v) / 40.0) + 0.5 * ((peak - in_v) / 40.0), 0.0, 1.0))
+        ok = False
+        if peak < _MIN_SIDE_ON:
+            side_scores.append(0.0)
+            continue
+        if out_ok and in_ok:
+            d_out = peak - float(out_v)
+            d_in = peak - float(in_v)
+            ok = (d_out >= _MIN_SIDE_DELTA_OUT and d_in >= _MIN_SIDE_DELTA_IN) or (
+                d_in >= _MIN_SIDE_DELTA_OUT and d_out >= 0.0
+            )
+            if ok:
+                score = float(np.clip(0.5 * (max(d_out, 0.0) / 40.0) + 0.5 * (max(d_in, 0.0) / 40.0), 0.0, 1.0))
+        elif out_ok and not in_ok:
+            d_out = peak - float(out_v)
+            ok = d_out >= _MIN_SIDE_DELTA_OUT
+            if ok:
+                score = float(np.clip(d_out / 50.0, 0.0, 1.0))
+        elif in_ok and not out_ok:
+            d_in = peak - float(in_v)
+            ok = d_in >= _MIN_SIDE_DELTA_OUT
+            if ok:
+                score = float(np.clip(d_in / 50.0, 0.0, 1.0))
+        if ok and score >= 0.08:
             supported += 1
-        elif peak >= _MIN_SIDE_ON and (peak - max(out_v, in_v)) >= _MIN_SIDE_DELTA_OUT:
-            # Clipped / one-sided comparison when the far band is off-frame or similar.
-            score = float(np.clip((peak - max(out_v, in_v)) / 50.0, 0.0, 1.0))
-            if score >= 0.12:
-                supported += 1
+        else:
+            score = 0.0
         side_scores.append(score)
     mean_score = float(np.mean(side_scores)) if side_scores else 0.0
-    return side_scores, supported, mean_score
+    return EdgeBandResult(
+        scores=side_scores,
+        supported=supported,
+        mean=mean_score,
+        band_width=float(np.mean(near_acc)) if near_acc else 0.0,
+        inner_offset=float(np.mean(far_acc)) if far_acc else 0.0,
+        outer_offset=float(np.mean(far_acc)) if far_acc else 0.0,
+        side_lengths=lengths,
+    )
 
 
 def _quad_region_stats(gray: np.ndarray, corners: np.ndarray) -> tuple[float, float, np.ndarray]:
@@ -259,7 +329,10 @@ def confirm_document(frame: np.ndarray, geom: DocumentGeometryResult) -> Documen
 
     work, work_pts, _scale = _prepare(gray, corners)
     mag = _sobel_mag(work)
-    _side_scores, sides, edge_score = _side_edge_scores(mag, work_pts)
+    edge = _side_edge_scores(mag, work_pts)
+    scores = (edge.scores + [0.0, 0.0, 0.0, 0.0])[:4]
+    sides = edge.supported
+    edge_score = edge.mean
     edge_support = float(sides) / 4.0
     interior_mean, interior_std, interior_pts = _quad_region_stats(work, work_pts)
     surround_mean, surround_std = _surround_stats(work, work_pts)
@@ -276,9 +349,13 @@ def confirm_document(frame: np.ndarray, geom: DocumentGeometryResult) -> Documen
     min_paper = _MIN_PAPER_DELTA_BOOKLET if booklet else _MIN_PAPER_DELTA
 
     if sides < min_sides:
-        # Strong candidate-relative paper/table split can compensate for a
-        # minAreaRect that only finds 2 clean sides (open booklet / paper_region).
-        if paper_delta >= 28.0 and sides >= 2:
+        two_side_ok = (
+            sides >= 2
+            and paper_delta >= min_paper
+            and edge_score >= _TWO_SIDE_MEAN_SCORE
+        )
+        strong_paper = paper_delta >= 28.0 and sides >= 2
+        if two_side_ok or strong_paper:
             reason = "accepted"
             accepted = True
         else:
@@ -323,6 +400,17 @@ def confirm_document(frame: np.ndarray, geom: DocumentGeometryResult) -> Documen
         geometry_mode=str(geom.geometry_mode),
         geometry_aspect=float(geom.aspect_ratio),
         geometry_area_fraction=float(geom.selected_area_ratio),
+        edge_support_top=float(scores[0]),
+        edge_support_right=float(scores[1]),
+        edge_support_bottom=float(scores[2]),
+        edge_support_left=float(scores[3]),
+        edge_support_mean=float(edge_score),
+        edge_support_min=float(min(scores)) if scores else 0.0,
+        working_width=int(work.shape[1]),
+        working_height=int(work.shape[0]),
+        edge_band_width_px=float(edge.band_width),
+        edge_band_inner_offset_px=float(edge.inner_offset),
+        edge_band_outer_offset_px=float(edge.outer_offset),
     )
 
 
@@ -397,7 +485,11 @@ class DocumentConfirmationTracker:
             "evidence_interior_std=%.1f evidence_surround_std=%.1f evidence_print=%.3f "
             "evidence_line_structure=%.3f evidence_fold=%.3f roi_x=%d roi_y=%d "
             "roi_width=%d roi_height=%d geometry_mode=%s geometry_aspect=%.3f "
-            "geometry_area_fraction=%.3f geometry_rotation_deg=%.1f geometry_border_sides=%d",
+            "geometry_area_fraction=%.3f geometry_rotation_deg=%.1f geometry_border_sides=%d "
+            "working_resolution=%dx%d edge_support_top=%.3f edge_support_right=%.3f "
+            "edge_support_bottom=%.3f edge_support_left=%.3f edge_support_mean=%.3f "
+            "edge_support_min=%.3f supported_sides=%d interior_surround=%.3f "
+            "band_width_px=%.1f inner_offset_px=%.1f outer_offset_px=%.1f",
             status,
             result.reason,
             int(result.accepted),
@@ -423,4 +515,34 @@ class DocumentConfirmationTracker:
             result.geometry_area_fraction,
             float(getattr(geom, "rotation_deg", 0.0) or 0.0),
             int(getattr(geom, "border_sides", 0) or 0),
+            result.working_width,
+            result.working_height,
+            result.edge_support_top,
+            result.edge_support_right,
+            result.edge_support_bottom,
+            result.edge_support_left,
+            result.edge_support_mean,
+            result.edge_support_min,
+            result.evidence_edge_sides,
+            result.evidence_paper_contrast,
+            result.edge_band_width_px,
+            result.edge_band_inner_offset_px,
+            result.edge_band_outer_offset_px,
+        )
+        logger.debug(
+            "event=document_confirmation_edges reason=%s top=%.3f right=%.3f bottom=%.3f left=%.3f "
+            "mean=%.3f min=%.3f sides=%d band=%.1f inner=%.1f outer=%.1f work=%dx%d",
+            result.reason,
+            result.edge_support_top,
+            result.edge_support_right,
+            result.edge_support_bottom,
+            result.edge_support_left,
+            result.edge_support_mean,
+            result.edge_support_min,
+            result.evidence_edge_sides,
+            result.edge_band_width_px,
+            result.edge_band_inner_offset_px,
+            result.edge_band_outer_offset_px,
+            result.working_width,
+            result.working_height,
         )

@@ -27,7 +27,8 @@ from idcam.logging.setup import get_logger
 logger = get_logger("vision.geometry")
 
 # Working width for contour search. 1920×1080 is scaled down then mapped back.
-WORKING_WIDTH = 960
+# 1280 keeps Canny/Sobel edges usable on Pi 5 without a full-preview contour pass.
+WORKING_WIDTH = 1280
 
 MIN_AREA_FRACTION = 0.08
 MAX_AREA_FRACTION = 0.97
@@ -41,7 +42,7 @@ MIN_RIGHT_ANGLE = 0.55  # 1 - mean|cos|; 90° edges → 1.0
 SMALL_EVIDENCE_MIN_AREA = 0.030
 SMALL_MIN_REL_SIDE = 0.09
 SMALL_MIN_DIAG_FRAC = 0.14
-WORKING_WIDTH_REFINE = 1440
+WORKING_WIDTH_REFINE = 1600
 
 # Two-page merge: opened passport / booklet. Not a generic blob union.
 MERGE_MIN_HEIGHT_RATIO = 0.82

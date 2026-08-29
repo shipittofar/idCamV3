@@ -46,6 +46,7 @@ from idcam.vision.geometry_debug import (  # noqa: E402
     classify_failure,
     diagnose_frame,
     effective_geometry_config,
+    effective_resolution_chain,
     render_overlay,
     save_rgb_jpeg,
 )
@@ -149,6 +150,8 @@ def main() -> int:
 
     print("=== FRAME ===")
     print(json.dumps({"source": source, "shape": list(frame.shape), "saved": str(raw_path), "overlay": str(overlay_path)}, indent=2))
+    print("=== RESOLUTION_CHAIN ===")
+    print(json.dumps(effective_resolution_chain(int(frame.shape[1]), int(frame.shape[0])), indent=2))
     print("=== DOCUMENT_GEOMETRY ===")
     print(
         json.dumps(
@@ -196,12 +199,26 @@ def main() -> int:
             {
                 "result": "accepted" if confirmation.accepted else "rejected",
                 "reason": confirmation.reason,
-                "edge_support": confirmation.evidence_edge_support,
-                "edge_sides": confirmation.evidence_edge_sides,
+                "working_resolution": f"{confirmation.working_width}x{confirmation.working_height}",
+                "edge_support": {
+                    "top": confirmation.edge_support_top,
+                    "right": confirmation.edge_support_right,
+                    "bottom": confirmation.edge_support_bottom,
+                    "left": confirmation.edge_support_left,
+                    "mean": confirmation.edge_support_mean,
+                    "min": confirmation.edge_support_min,
+                    "supported_sides": confirmation.evidence_edge_sides,
+                    "band_width_px": confirmation.edge_band_width_px,
+                    "inner_offset_px": confirmation.edge_band_inner_offset_px,
+                    "outer_offset_px": confirmation.edge_band_outer_offset_px,
+                },
                 "interior_surround": confirmation.evidence_paper_contrast,
                 "fold": confirmation.evidence_fold,
                 "print": confirmation.evidence_print,
                 "geometry_mode": confirmation.geometry_mode,
+                "occupancy": confirmation.geometry_area_fraction,
+                "rotation_deg": geom.rotation_deg,
+                "border_contacts": geom.border_sides,
             },
             indent=2,
         )
