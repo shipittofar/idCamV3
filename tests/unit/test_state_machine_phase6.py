@@ -208,10 +208,10 @@ class TestFailures:
         assert orch._awaiting_clear_scene is True
         orch.autofocus.run_autofocus.assert_awaited_once()
         orch._safe_preview = AsyncMock(return_value=page)
-        for _ in range(6):
-            await orch._idle_tick()
+        await orch._idle_tick()
         assert orch.sm.state == AppState.IDLE
         assert orch._transaction is None
+        assert orch._awaiting_clear_scene is True
 
     @pytest.mark.asyncio
     async def test_focus_verify_retries_then_fails(self, app_config):

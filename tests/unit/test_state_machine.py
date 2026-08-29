@@ -84,11 +84,12 @@ class TestStateMachine:
         sm.entered_at = time.monotonic() - 10000
         assert not sm.is_timed_out()
 
-    def test_no_timeout_for_removal(self, timeouts):
+    def test_timeout_for_removal(self, timeouts):
         sm = StateMachine(state=AppState.WAITING_FOR_REMOVAL)
         sm.set_timeouts(timeouts)
+        assert sm.timeout_for_state() == timeouts.waiting_for_removal
         sm.entered_at = time.monotonic() - 10000
-        assert not sm.is_timed_out()
+        assert sm.is_timed_out()
 
     def test_in_transaction_states(self):
         sm = StateMachine(state=AppState.UPLOADING)

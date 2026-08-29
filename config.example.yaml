@@ -34,6 +34,7 @@ state_timeouts:
   uploading: 60
   waiting_for_server: 60
   processing_response: 10
+  waiting_for_removal: 20
 
 camera:
   preview_width: 1920
@@ -55,7 +56,7 @@ detection:
   motion_threshold: 8.0
   edge_density_threshold: 0.02
   stable_frames_required: 8
-  removal_frames_required: 10
+  removal_frames_required: 4
   removal_motion_factor: 0.5
   removal_edge_factor: 0.5
   baseline_alpha: 0.05
@@ -63,6 +64,7 @@ detection:
   geometry_smooth_alpha: 0.40
   geometry_stability_threshold_px: 12.0
   geometry_stable_frames_required: 5
+  geometry_stability_miss_tolerance: 1
 
 quality:
   min_sharpness: 80.0

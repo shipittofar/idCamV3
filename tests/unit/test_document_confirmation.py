@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+import time
 
 import cv2
 import numpy as np
@@ -522,7 +523,7 @@ async def test_auto_capture_placement_matrix(app_config, label, box):
     await _assert_auto_if_geometry(orch, _id_card(box=box, printed=True), app_config)
 
 
-@pytest.mark.parametrize("angle", [0, 20, 45, 90])
+@pytest.mark.parametrize("angle", [0, 20, 45, 60, 90])
 @pytest.mark.asyncio
 async def test_auto_capture_rotation_matrix(app_config, angle):
     orch = _orch(app_config)
@@ -630,3 +631,83 @@ async def test_pre_capture_ignores_confirm_document_reject(app_config, tmp_path)
         await orch._capturing_tick()
     mocked.assert_not_called()
     assert orch.sm.state == AppState.IMAGE_VALIDATION
+
+
+@pytest.mark.asyncio
+async def test_raw_quad_none_does_not_abort_when_detector_present(app_config):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.FOCUSING
+    orch._resume_state = AppState.IDLE
+    orch._transaction = ActiveCaptureTransaction(capture_id="cap-1", trigger="auto")
+    page = _id_card(printed=True)
+    orch._snapshot_accepted_geometry(DocumentDetector(app_config.detection).detect_geometry(page))
+    orch._safe_preview = AsyncMock(return_value=page)
+    orch.autofocus.run_autofocus = AsyncMock(
+        return_value=AutofocusResult(True, 90.0, 1, None, "hardware_cycle", 10.0)
+    )
+    with patch("idcam.app.orchestrator.find_document_quad", return_value=(None, 0)):
+        await orch._focusing_tick()
+    orch.autofocus.run_autofocus.assert_awaited()
+    assert orch.sm.state == AppState.FOCUS_VERIFICATION
+
+
+@pytest.mark.asyncio
+async def test_post_af_raw_miss_is_not_document_moved(app_config):
+    orch = _orch(app_config)
+    page = _id_card(printed=True)
+    geom = DocumentDetector(app_config.detection).detect_geometry(page)
+    orch._snapshot_accepted_geometry(geom)
+    orch.detector.detect_geometry(page)
+    with patch("idcam.app.orchestrator.find_document_quad", return_value=(None, 0)):
+        moved, displacement = orch._geometry_moved_readonly(page)
+    assert moved is False
+    assert displacement == 0.0
+
+
+@pytest.mark.asyncio
+async def test_real_large_movement_still_aborts(app_config):
+    orch = _orch(app_config)
+    a = DocumentDetector(app_config.detection).detect_geometry(_id_card(box=(40, 40, 480, 360), printed=True))
+    b_frame = _id_card(box=(200, 160, 360, 260), printed=True)
+    orch._snapshot_accepted_geometry(a)
+    moved, displacement = orch._geometry_moved_readonly(b_frame)
+    assert displacement > orch.geometry_stability.threshold_px
+    assert moved is True
+
+
+@pytest.mark.asyncio
+async def test_success_enters_removal_without_sleep(app_config):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.SUCCESS
+    orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
+    orch._transaction.mark_completed()
+    with patch("idcam.app.orchestrator.asyncio.sleep", new_callable=AsyncMock) as slept:
+        await orch._success_tick()
+    slept.assert_not_called()
+    assert orch.sm.state == AppState.WAITING_FOR_REMOVAL
+
+
+@pytest.mark.asyncio
+async def test_removal_timeout_does_not_stay_forever(app_config):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.WAITING_FOR_REMOVAL
+    orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
+    orch._transaction.mark_completed()
+    orch.sm.entered_at = time.monotonic() - 30.0
+    handled = await orch._handle_state_timeout()
+    assert handled is True
+    assert orch.sm.state == AppState.IDLE
+
+
+@pytest.mark.asyncio
+async def test_document_removed_reaches_idle_in_required_frames(app_config):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.WAITING_FOR_REMOVAL
+    orch._transaction = ActiveCaptureTransaction(capture_id="cap-ok")
+    orch._transaction.mark_completed()
+    orch._safe_preview = AsyncMock(return_value=_wood_table((480, 640)))
+    required = app_config.detection.removal_frames_required
+    for _ in range(required):
+        await orch._removal_tick()
+    assert orch.sm.state == AppState.IDLE
+

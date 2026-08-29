@@ -94,7 +94,7 @@ class DetectionConfig(BaseModel):
     motion_threshold: float = Field(8.0, gt=0)
     edge_density_threshold: float = Field(0.02, gt=0, le=1.0)
     stable_frames_required: int = Field(8, ge=2, le=60)
-    removal_frames_required: int = Field(10, ge=2, le=120)
+    removal_frames_required: int = Field(4, ge=2, le=120)
     removal_motion_factor: float = Field(0.5, gt=0, le=1.0)
     removal_edge_factor: float = Field(0.5, gt=0, le=2.0)
     baseline_alpha: float = Field(0.05, gt=0, le=1.0)
@@ -108,6 +108,8 @@ class DetectionConfig(BaseModel):
     # Consecutive low-movement geometry frames before auto-capture may start.
     # At preview_fps=5 this is 1.0 s after the first present observation.
     geometry_stable_frames_required: int = Field(5, ge=2, le=60)
+    # One-frame finder miss / corner jitter tolerated before resetting the counter.
+    geometry_stability_miss_tolerance: int = Field(1, ge=0, le=10)
 
 
 class QualityConfig(BaseModel):
@@ -144,6 +146,7 @@ class StateTimeoutsConfig(BaseModel):
     waiting_for_server: float = Field(60.0, gt=0, le=600)
     processing_response: float = Field(10.0, gt=0, le=60)
     success: float = Field(5.0, gt=0, le=30)
+    waiting_for_removal: float = Field(20.0, gt=0, le=300)
     recovery: float = Field(180.0, gt=0, le=600)
     shutdown: float = Field(30.0, gt=0, le=120)
 
@@ -162,6 +165,7 @@ class StateTimeoutsConfig(BaseModel):
             "WAITING_FOR_SERVER": self.waiting_for_server,
             "PROCESSING_RESPONSE": self.processing_response,
             "SUCCESS": self.success,
+            "WAITING_FOR_REMOVAL": self.waiting_for_removal,
             "RECOVERY": self.recovery,
             "SHUTDOWN": self.shutdown,
         }

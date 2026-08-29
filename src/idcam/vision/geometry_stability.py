@@ -48,20 +48,26 @@ class GeometryStability:
 
     The first present observation only seeds the previous corners and never
     reports ready. A later frame is stable when mean corner motion is at or
-    below ``threshold_px``; otherwise the consecutive counter resets.
+    below ``threshold_px``. A single absent frame or a single over-threshold
+    jitter does not wipe the counter (``miss_tolerance``).
     """
 
-    def __init__(self, *, threshold_px: float, frames_required: int) -> None:
+    def __init__(self, *, threshold_px: float, frames_required: int, miss_tolerance: int = 1) -> None:
         self.threshold_px = float(threshold_px)
         self.frames_required = int(frames_required)
+        self.miss_tolerance = max(0, int(miss_tolerance))
         self._prev_corners: np.ndarray | None = None
         self._stable_count = 0
         self._last_displacement = 0.0
+        self._absent_streak = 0
+        self._jitter_streak = 0
 
     def reset(self) -> None:
         self._prev_corners = None
         self._stable_count = 0
         self._last_displacement = 0.0
+        self._absent_streak = 0
+        self._jitter_streak = 0
 
     @property
     def stable_count(self) -> int:
@@ -78,21 +84,29 @@ class GeometryStability:
     def update(self, geometry: DocumentGeometryResult) -> bool:
         """Return True when consecutive stable geometry frames meet the requirement."""
         if not geometry.present or geometry.corners is None:
-            self.reset()
-            return False
+            self._absent_streak += 1
+            if self._absent_streak > self.miss_tolerance:
+                self.reset()
+                return False
+            return self._stable_count >= self.frames_required
+        self._absent_streak = 0
         corners = order_corners(np.asarray(geometry.corners, dtype=np.float32))
         if self._prev_corners is None:
             self._prev_corners = corners
             self._stable_count = 0
             self._last_displacement = 0.0
+            self._jitter_streak = 0
             return False
         displacement = mean_corner_displacement_px(self._prev_corners, corners)
         self._last_displacement = displacement
         self._prev_corners = corners
         if displacement <= self.threshold_px:
+            self._jitter_streak = 0
             self._stable_count += 1
         else:
-            self._stable_count = 0
+            self._jitter_streak += 1
+            if self._jitter_streak > self.miss_tolerance:
+                self._stable_count = 0
         return self._stable_count >= self.frames_required
 
     def debug_info(self) -> GeometryStabilityDebug:

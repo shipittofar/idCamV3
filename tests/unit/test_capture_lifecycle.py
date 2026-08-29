@@ -190,16 +190,19 @@ class TestAutoCapturePath:
 
 class TestIdleDoesNotStayWhenReady:
     @pytest.mark.asyncio
-    async def test_awaiting_clear_scene_does_not_retry_same_document(self, app_config):
+    async def test_awaiting_clear_scene_rearms_while_document_still_present(self, app_config):
         orch = _orch(app_config)
         orch.sm.state = AppState.IDLE
         orch._awaiting_clear_scene = True
         orch._safe_preview = AsyncMock(return_value=_document_frame())
-        for _ in range(6):
-            await orch._idle_tick()
-        assert orch.sm.state == AppState.IDLE
+        await orch._idle_tick()
         assert orch._awaiting_clear_scene is True
         assert orch._transaction is None
+        for _ in range(8):
+            await orch._idle_tick()
+            if orch._awaiting_clear_scene is False:
+                break
+        assert orch._awaiting_clear_scene is False
 
 
 class TestAutoDetectStableFocusCapture:
@@ -449,7 +452,7 @@ class TestPhase2CGeometryPolicy:
         assert orch.sm.state == AppState.IDLE
 
     @pytest.mark.asyncio
-    async def test_failed_auto_capture_does_not_retry_same_document(self, app_config):
+    async def test_failed_auto_capture_can_rearm_while_document_present(self, app_config):
         orch = _orch(app_config)
         orch.sm.state = AppState.FOCUSING
         orch._resume_state = AppState.IDLE
@@ -457,20 +460,11 @@ class TestPhase2CGeometryPolicy:
         await orch._fail_transaction_and_wait("focus_failed", "soft")
         assert orch._awaiting_clear_scene is True
         orch._safe_preview = AsyncMock(return_value=_document_frame())
-        for _ in range(8):
-            await orch._idle_tick()
-        assert orch.sm.state == AppState.IDLE
-        assert orch._transaction is None
-        assert orch._awaiting_clear_scene is True
-
-        orch._safe_preview = AsyncMock(return_value=_empty_frame())
         for _ in range(12):
             await orch._idle_tick()
             if orch._awaiting_clear_scene is False:
                 break
         assert orch._awaiting_clear_scene is False
-
-        orch._safe_preview = AsyncMock(return_value=_document_frame())
         await _idle_until_auto_detected(orch)
         assert orch._transaction.capture_id != "cap-fail"
 

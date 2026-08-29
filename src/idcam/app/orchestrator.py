@@ -104,6 +104,7 @@ class ApplicationOrchestrator:
         self.geometry_stability = GeometryStability(
             threshold_px=config.detection.geometry_stability_threshold_px,
             frames_required=config.detection.geometry_stable_frames_required,
+            miss_tolerance=config.detection.geometry_stability_miss_tolerance,
         )
         self.document_confirmation = DocumentConfirmationTracker(
             frames_required=config.detection.geometry_stable_frames_required,
@@ -136,6 +137,9 @@ class ApplicationOrchestrator:
         self._resume_state = AppState.IDLE
         self._awaiting_clear_scene = False
         self._clear_scene_count = 0
+        self._present_rearm_count = 0
+        self._stability_latched = False
+        self._removal_started_at = 0.0
         self._last_scene_empty = False
         self._last_transition_reason = ""
         self._capture_started = False
@@ -308,6 +312,18 @@ class ApplicationOrchestrator:
             self.sm.elapsed(),
             self._transaction.capture_id if self._transaction else None,
         )
+        if state == AppState.WAITING_FOR_REMOVAL:
+            logger.info(
+                "event=removal_timeout elapsed_ms=%.0f removal_count=%d geometry_present=%s",
+                self.sm.elapsed() * 1000.0,
+                self._removal_count,
+                int(self.detector.last_geometry().present),
+            )
+            self._clear_transaction()
+            self.geometry_stability.reset()
+            self._awaiting_clear_scene = False
+            self._transition(AppState.IDLE, reason="waiting_for_removal_timeout")
+            return True
         if state == AppState.DOCUMENT_DETECTED:
             self._abort_transaction("document_detected_timeout")
             self._clear_transaction()
@@ -424,14 +440,19 @@ class ApplicationOrchestrator:
         return bool(geom.present and geometry_ready)
 
     def _preview_candidate_usable(self, frame) -> bool:
-        """True if the preview still has a geometry candidate (not a semantic classifier)."""
+        """True if the detector still reports a candidate (including hold)."""
         if frame is None:
             return False
-        raw, _count = find_document_quad(frame)
-        return raw is not None
+        geom = self.detector.detect_geometry(frame)
+        return bool(geom.present)
 
     def _geometry_moved_readonly(self, frame) -> tuple[bool, float]:
-        """Capture-time jitter vs accepted READY corners. Does not mutate detector state."""
+        """Capture-time jitter vs accepted READY corners. Does not mutate detector EMA.
+
+        A missing raw quad is not treated as infinite motion when the detector
+        still reports presence (including geometry_held).
+        """
+        geom = self.detector.detect_geometry(frame)
         previous = None
         if self._accepted_geometry is not None and self._accepted_geometry.corners is not None:
             previous = self._accepted_geometry.corners_array()
@@ -443,10 +464,34 @@ class ApplicationOrchestrator:
                 return False, 0.0
             previous = last.corners_array()
         raw, _count = find_document_quad(frame)
+        raw_present = raw is not None
+        logger.info(
+            "event=geometry_motion_check old_quad_present=%s new_quad_present=%s "
+            "geometry_present=%s geometry_reason=%s displacement_threshold_px=%.2f",
+            int(previous is not None),
+            int(raw_present),
+            int(geom.present),
+            geom.reason,
+            self.geometry_stability.threshold_px,
+        )
         if raw is None:
+            if geom.present:
+                logger.info(
+                    "event=geometry_motion_check result=hold displacement_px=0.00 "
+                    "displacement_threshold_px=%.2f",
+                    self.geometry_stability.threshold_px,
+                )
+                return False, 0.0
             return True, float("inf")
         displacement = mean_corner_displacement_px(previous, raw.corners)
-        return displacement > self.geometry_stability.threshold_px, displacement
+        moved = displacement > self.geometry_stability.threshold_px
+        logger.info(
+            "event=geometry_motion_check result=%s displacement_px=%.2f displacement_threshold_px=%.2f",
+            "moved" if moved else "ok",
+            displacement,
+            self.geometry_stability.threshold_px,
+        )
+        return moved, displacement
 
     def _log_geometry_status(self, status: str, geom: DocumentGeometryResult) -> None:
         if status == self._last_geometry_status:
@@ -483,10 +528,12 @@ class ApplicationOrchestrator:
         self._publish_debug(frame)
         if moving:
             logger.warning(
-                "event=capture_geometry_abort state=%s displacement_px=%.2f threshold_px=%.2f",
+                "event=capture_geometry_abort state=%s displacement_px=%.2f threshold_px=%.2f "
+                "geometry_present=%s",
                 self.sm.state.value,
                 displacement,
                 self.geometry_stability.threshold_px,
+                int(self.detector.last_geometry().present),
             )
             await self._fail_transaction_and_wait("stability_timeout", "Document moved during capture")
             return False
@@ -512,6 +559,8 @@ class ApplicationOrchestrator:
             self.document_confirmation.reset()
             self._resume_state = AppState.IDLE
             self._awaiting_clear_scene = False
+            self._present_rearm_count = 0
+            self._stability_latched = False
             self._manual_capture_requested = True
             self._begin_transaction(trigger="manual")
             self._set_manual_phase("focusing", "Manual capture started")
@@ -523,6 +572,7 @@ class ApplicationOrchestrator:
         self._last_scene_empty = not present
         self._publish_debug(frame)
         if self._awaiting_clear_scene and not present:
+            self._present_rearm_count = 0
             self._clear_scene_count += 1
             self._log_geometry_status("geometry_absent", geom)
             if self._clear_scene_count >= self.config.detection.removal_frames_required:
@@ -532,8 +582,17 @@ class ApplicationOrchestrator:
             return
         if self._awaiting_clear_scene and present:
             self._clear_scene_count = 0
-            self._log_geometry_status("auto_rearm_blocked", geom)
-            return
+            self._present_rearm_count += 1
+            rearm_n = max(2, int(self.config.detection.geometry_stable_frames_required))
+            if self._present_rearm_count < rearm_n:
+                self._log_geometry_status("auto_rearm_pending", geom)
+                return
+            self._awaiting_clear_scene = False
+            self._present_rearm_count = 0
+            logger.info(
+                "event=auto_capture_armed reason=document_still_present frames=%d",
+                rearm_n,
+            )
         if self._auto_document_ready(geom, ready):
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
@@ -586,6 +645,7 @@ class ApplicationOrchestrator:
             txn.confirmed_geometry_mode = last.geometry_mode
             txn.confirmed_roi = last.bbox if last.bbox != (0, 0, 0, 0) else None
         self._transaction = txn
+        self._stability_latched = trigger == "auto"
         self._stability_absent_count = 0
         self._capture_path = None
         self._idle_reject_count = 0
@@ -718,7 +778,8 @@ class ApplicationOrchestrator:
             self.sm.touch_progress()
             return
         self._stability_absent_count = 0
-        if ready:
+        displacement_ok = self.geometry_stability.last_displacement_px <= self.geometry_stability.threshold_px
+        if geom.present and displacement_ok and (ready or self._stability_latched):
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
                 "event=auto_capture_gate geometry_present=1 geometry_stable=1 auto_capture_gate=1 "
@@ -764,10 +825,17 @@ class ApplicationOrchestrator:
             return
         auto = self._transaction.trigger == "auto"
         if auto and not self._preview_candidate_usable(frame):
+            last = self.detector.last_geometry()
+            raw, _n = find_document_quad(frame)
             logger.warning(
-                "event=document_absent reason=pre_af_recheck capture_id=%s "
-                "geometry_present=0 confirmation_blocking=0",
+                "event=auto_capture_abort state_from=%s failure_key=document_absent "
+                "reason=pre_af_recheck capture_id=%s geometry_present=%s raw_quad_present=%s "
+                "geometry_reason=%s awaiting_clear_scene=1",
+                self.sm.state.value,
                 self._transaction.capture_id,
+                int(last.present),
+                int(raw is not None),
+                last.reason,
             )
             await self._fail_transaction_and_wait("document_absent", "Document candidate gone before autofocus")
             return
@@ -914,10 +982,17 @@ class ApplicationOrchestrator:
         if self._transaction.trigger == "auto":
             preview = await self._safe_preview()
             if preview is None or not self._preview_candidate_usable(preview):
+                last = self.detector.last_geometry()
+                raw, _n = find_document_quad(preview) if preview is not None else (None, 0)
                 logger.warning(
-                    "event=document_absent reason=pre_capture_recheck capture_id=%s "
-                    "geometry_present=0 confirmation_blocking=0",
+                    "event=auto_capture_abort state_from=%s failure_key=document_absent "
+                    "reason=pre_capture_recheck capture_id=%s geometry_present=%s raw_quad_present=%s "
+                    "geometry_reason=%s awaiting_clear_scene=1",
+                    self.sm.state.value,
                     self._transaction.capture_id,
+                    int(last.present),
+                    int(raw is not None),
+                    last.reason,
                 )
                 await self._fail_transaction_and_wait("document_absent", "Document candidate gone before capture")
                 return
@@ -1150,6 +1225,7 @@ class ApplicationOrchestrator:
             self._transaction.mark_completed()
             self.temp_store.cleanup(self._capture_path)
             logger.info("event=transaction_completed capture_id=%s", self._transaction.capture_id)
+            logger.info("event=upload_success capture_id=%s http_status=%s", self._transaction.capture_id, response.http_status)
             logger.info("event=pipeline_stage stage=success capture_id=%s", self._transaction.capture_id)
             self._finish_manual_request(
                 {
@@ -1175,9 +1251,9 @@ class ApplicationOrchestrator:
     async def _success_tick(self) -> None:
         if not self._claim_state_action():
             return
-        await asyncio.sleep(2.0)
         self._removal_count = 0
         self._last_scene_empty = False
+        self._removal_started_at = time.monotonic()
         self._transition(AppState.WAITING_FOR_REMOVAL, reason="capture_success")
 
     async def _removal_tick(self) -> None:
@@ -1195,15 +1271,29 @@ class ApplicationOrchestrator:
             self._transition(AppState.DOCUMENT_DETECTED, reason="manual_capture")
             return
         geom, _ready = self._observe_geometry(frame)
-        empty = not geom.present
+        raw, _count = find_document_quad(frame)
+        empty = raw is None
         self._last_scene_empty = empty
         if empty:
             self._removal_count += 1
-            self._log_geometry_status("geometry_absent", geom)
+            self._log_geometry_status("geometry_absent" if not geom.present else "geometry_held_raw_absent", geom)
         else:
             self._removal_count = 0
             self._log_geometry_status("geometry_present", geom)
             self.sm.touch_progress()
+        elapsed_ms = 0.0
+        if self._removal_started_at:
+            elapsed_ms = (time.monotonic() - self._removal_started_at) * 1000.0
+        logger.info(
+            "event=removal_check removal_count=%d removal_required=%d geometry_present=%s "
+            "raw_quad_present=%s geometry_reason=%s elapsed_ms=%.0f",
+            self._removal_count,
+            self.config.detection.removal_frames_required,
+            int(geom.present),
+            int(raw is not None),
+            geom.reason,
+            elapsed_ms,
+        )
         self._publish_debug(frame)
 
         if self._removal_count >= self.config.detection.removal_frames_required:
@@ -1332,6 +1422,18 @@ class ApplicationOrchestrator:
             **self._health_status_kwargs(),
         )
         logger.info(
+            "event=auto_capture_abort state_from=%s failure_key=%s detail=%s capture_id=%s "
+            "next_state=%s geometry_present=%s geometry_reason=%s awaiting_clear_scene=%s",
+            self.sm.state.value,
+            failure_key,
+            detail,
+            self._transaction.capture_id if self._transaction else None,
+            dest.value,
+            int(self.detector.last_geometry().present),
+            self.detector.last_geometry().reason,
+            int(dest == AppState.IDLE),
+        )
+        logger.info(
             "event=transaction_failed reason=%s detail=%s capture_id=%s next_state=%s",
             failure_key,
             detail,
@@ -1360,6 +1462,8 @@ class ApplicationOrchestrator:
         if dest == AppState.IDLE:
             self._awaiting_clear_scene = True
             self._clear_scene_count = 0
+            self._present_rearm_count = 0
+            self._stability_latched = False
             self._clear_transaction()
             self._transition(AppState.IDLE, reason=f"{failure_key}")
         else:

@@ -53,7 +53,6 @@ CAPTURE_IN_PROGRESS_STATES = {
 NO_TIMEOUT_STATES = {
     AppState.CAMERA_READY,
     AppState.IDLE,
-    AppState.WAITING_FOR_REMOVAL,  # removal is mandatory; no idle escape via timeout
     AppState.ERROR,
 }
 

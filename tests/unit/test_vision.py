@@ -479,8 +479,11 @@ class TestGeometryStability:
         gate.update(a)
         assert gate.stable_count >= 1
         gate.update(b)
+        assert gate.stable_count >= 1
+        c = detector.detect_geometry(_page_on_table((480, 640), (200, 140, 480, 360)))
+        gate.update(c)
         assert gate.stable_count == 0
-        assert gate.update(b) is False
+        assert gate.update(c) is False
 
     def test_absent_resets(self, detection_config):
         gate = GeometryStability(threshold_px=12.0, frames_required=2)
@@ -491,6 +494,8 @@ class TestGeometryStability:
         absent = DocumentGeometryResult(
             present=False, confidence=0.0, corners=None, bbox=None, reason="no_quadrilateral"
         )
+        gate.update(absent)
+        assert gate.stable_count >= 1
         gate.update(absent)
         assert gate.stable_count == 0
 
