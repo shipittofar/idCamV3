@@ -72,6 +72,7 @@ def runtime_code_report() -> dict:
         "source_has_merged_two_page": "merged_two_page" in src,
         "source_has_suppress_inner": "_suppress_inner_quads" in src,
         "source_has_large_occupancy_lobe": "0.72" in src and "_area_term" in src,
+        "source_has_large_document": "_build_large_document_candidate" in src,
         "systemd_show": _run(["systemctl", "show", "idcam", "-p", "FragmentPath", "-p", "ExecStart", "-p", "MainPID", "-p", "ActiveState"]),
         "idcam_which": _run(["sh", "-c", "command -v idcam || true"]),
     }
@@ -161,6 +162,12 @@ def main() -> int:
                 "detector_reason": geom.reason,
                 "detector_mode": geom.geometry_mode,
                 "case": case,
+                "quad_aspect": None if best is None else best.quad_aspect,
+                "edge_support": None if best is None else best.edge_support,
+                "border_sides": None if best is None else best.border_sides,
+                "rotation_angle": None if best is None else best.rotation_angle,
+                "recovered_corner_source": None if best is None else best.recovered_corner_source,
+                "large_document_candidate": False if best is None else best.geometry_mode == "large_document_outer",
             },
             indent=2,
         )
@@ -171,7 +178,12 @@ def main() -> int:
     print(json.dumps(trace.merges, indent=2, default=str))
     print("=== CLASSIFICATION ===")
     print(case)
-    print("ROOT CAUSE IDENTIFIED — FIX NOT YET IMPLEMENTED" if case in {"A", "B", "C", "D", "E", "F"} else "CASE G (includes success or unclassified). FIX NOT APPLIED.")
+    if best is not None and case == "G":
+        print("FINDER RETURNED A QUAD — hardware proof still requires Pi overlay of the outer booklet.")
+    elif case in {"A", "B", "C", "D", "E", "F"}:
+        print("NO OUTER QUAD ACCEPTED — inspect CANDIDATES / large_document_rejection_reason.")
+    else:
+        print("UNCLASSIFIED / no finder quad.")
     return 0
 
 

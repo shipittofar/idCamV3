@@ -1,90 +1,115 @@
 # PHASE 2 — LARGE DOCUMENT / TWO-PAGE DETECTION FIX
 
-Software status: **COMPLETE**  
-Hardware status: **PENDING**
+Software status: **UNIT TESTS PASSING — NOT HARDWARE-COMPLETE**  
+Hardware status: **PENDING** (do not treat this as proven on the Pi)
 
-Scope: `src/idcam/vision/geometry.py` and detector logging in `src/idcam/vision/document_detector.py`. Camera, AF, capture, validation, upload, and the Phase 6 state machine were not redesigned.
+Scope: `src/idcam/vision/geometry.py`, debug/trace helpers, unit tests, this document. Camera, AF, capture, validation, upload, UI, and the Phase 6 state machine were not changed.
 
-## 1. Root cause
+## 1. Confirmed Pi root cause
 
-Pipeline: preview RGB → `DocumentDetector.detect_geometry` → `find_document_quad` (`geometry.py`) → temporal hold/smooth in the detector → bbox used as AF ROI.
+Live 1920×1080 preview (2026-08-29), Desktop `geometry.py` with `MAX_ASPECT=3.35`, merge helpers present, service inactive:
 
-Opened / large passports failed in **candidate generation and scoring**, not in the state machine.
-
-| Mechanism | Effect |
+| | |
 |---|---|
-| `MAX_ASPECT = 2.60` | An opened ICAO passport is ~250×88 mm (**~2.84**). The outer quad was rejected as `aspect_out_of_range`. |
-| `_area_term` Gaussian peaked at **35%** of the frame | A half-page (~25–35%) outscored the outer booklet (~50–80%). |
-| `RETR_LIST` + Canny on a **center fold** | The seam split the edge map into two page rectangles. Each was a better “ID-like” quad than the outer hull. |
-| `_approx_quad` required **exactly 4** vertices | A slightly notched outer contour (fold) never became a quad, so only the inner pages survived. |
-| `MAX_AREA_FRACTION = 0.90` | Very large occupancy with a small margin could be dropped as `area_too_large`. |
+| CASE | **A** |
+| `accepted` | 0 |
+| `merge_attempts` | 0 |
+| `detector_reason` | `no_quadrilateral` |
 
-Failure was **not** temporal hysteresis (`geometry_hold_frames` / `geometry_smooth_alpha`); those still run after a quad is accepted.
+| ID | What it was | Why it died |
+|---|---|---|
+| C1 | tiny contour | `area_too_small` (0.044 &lt; 0.08) |
+| C2 | `[58,0,1112,1078]`, rect **0.185** | `low_rectangularity` (gate **0.72**). Hollow/broken outline of a **vertically clipped** booklet. |
+| C3 | `[0,0,1918,1078]`, aspect **3.77** | `aspect_out_of_range` (normal `MAX_ASPECT` **3.35**) plus a degenerate near-frame quad |
 
-There are no labeled Raspberry Pi passport stills in-repo for this fix (`_diagout/preview.png` / a capture JPEG exist but are not two-page fixtures).
+Illumination-normalized Canny/Sobel never produced a **filled** outer 4-gon. Real Hawkeye preview has no synthetic dark page border. Merge never ran because **no candidate was accepted**.
 
-## 2. Changes made
+A second bug: treating “≥3 corners on the image border” as `frame_aligned` would also reject a **valid** clipped passport (all four corners on top+bottom).
 
-### Files
+## 2. Why merge was never reached
 
-- `src/idcam/vision/geometry.py` — scoring, aspect limits, two-page merge, frame-quad reject, rate-limited reject logs
-- `src/idcam/vision/document_detector.py` — `geometry_mode` on `DocumentGeometryResult`; success log fields
-- `tests/unit/test_large_two_page_geometry.py` — new regressions
-- this document
+`_try_merge_two_page` only pairs **accepted** quads. CASE A had `accepted=0`, so `merge_attempts=0`. This was not a fold-gap / height-ratio miss (CASE B).
 
-### Algorithm (kept hard filters; did not globally lower rectangularity / confidence / right-angle)
+## 3. Files changed
 
-- **Aspect:** `MAX_ASPECT` 2.60 → **3.35** so a single outer booklet contour can pass. Merge path allows up to **3.45** with extra geometric gates.
-- **Area scoring:** keep the mid-size Gaussian (~0.35) **and** a second lobe around **~0.72** so large occupancy can compete with a single inner page without making a *bloated* 55% contour beat a tight 42% page.
-- **Two-page merge:** if two passing quads are side-by-side (similar height, high vertical overlap, small gap / slight overlap at the fold, combined aspect 1.45–3.45, combined area ≥ 16%), emit **one** outer quad `geometry_mode=merged_two_page` from left TL + right TR/BR + left BL.
-- **Inner suppression:** drop a quad contained in a **merged** (or ≥1.75× area) outer booklet so page L/R are not chosen instead of the passport.
-- **minAreaRect fallback:** only for contours with area 20–85% when `approxPolyDP` is not 4-sided (fold notches). Not used for near-full-frame blobs.
-- **Frame protection:** reject quads whose axis-aligned box spans **all four** image sides (`frame_aligned`) — the preview rectangle itself (Pi C3). A page that only hits top and bottom of a 16:9 frame is allowed. Ranking still penalizes `border_distance < 2.5`.
-- **Paper region (Pi CASE A):** illumination-normalized Canny sees hollow/broken outlines on real preview. Filled blobs are taken from **unnormalized** gray vs left/right table strips (`geometry_mode=paper_region`). Fold close can feed the existing two-page merge. `MIN_RECTANGULARITY` / `MIN_CONFIDENCE` were not lowered.
-- **False merge:** two distant rectangles fail the gap test (`MERGE_MAX_GAP_FRAC = 0.12` of the thinner page). They must not become one document.
+- `src/idcam/vision/geometry.py`
+- `src/idcam/vision/geometry_debug.py`
+- `scripts/passport_detection_debug.py`
+- `tests/unit/test_large_two_page_geometry.py`
+- `docs/LARGE_DOCUMENT_TWO_PAGE_DETECTION_FIX.md`
+- `docs/PASSPORT_DETECTION_RUNTIME_DEBUG.md` (Pi CASE A notes)
 
-### Logging
+## 4. Geometry / reconstruction added
 
-- Success (on present 0→1 only): `geometry_mode`, `document_area_ratio`, `document_bbox`, `document_quad`, `geometry_confidence` (existing `confidence=`).
-- Rejects: `event=geometry_candidate_rejected` at **DEBUG**, **≤1 Hz**, with area/aspect/rectangularity/corners/edge score/border distance/`rejection_reason`.
+**Normal path unchanged:** `MIN_AREA_FRACTION=0.08`, `MAX_AREA_FRACTION=0.97`, `MIN_ASPECT=0.40`, `MAX_ASPECT=3.35`, `MIN_RECTANGULARITY=0.72`, `MIN_CONFIDENCE=0.48`, `MIN_RIGHT_ANGLE=0.55`.
 
-### Downstream
+**Paper region (filled blob):** unnormalized gray vs the **darkest** of four border strips; isotropic morph close so a rotated fold can still join pages. `geometry_mode=paper_region` when that blob already passes **normal** gates (typical filled page).
 
-Geometry is still one preview-space quad + bbox. AF ROI continues to use `document_preview_roi` / accepted bbox. No orchestrator changes.
+**Large-document path** (`_build_large_document_candidate`, `geometry_mode=large_document_outer`): used only after the normal gates reject a recovered outer quad. It:
 
-## 3. Tests
+1. Recovers a convex 4-gon (`approxPolyDP` on the hull, else `minAreaRect`).
+2. Scores **that quad**, not raw contour area / min-area-rect (Pi C2 hollow rect 0.18 is not a global accept).
+3. Measures aspect from **side lengths**:  
+   `width_est = avg(top,bottom)`, `height_est = avg(left,right)`,  
+   `quad_aspect = max/min` (range 1.12–4.20 on this path only, covering observed 3.768-class recovered geometry without changing `MAX_ASPECT`).
+4. Requires edge support along the recovered sides, opposite-side consistency, interior angles, occupancy 0.12–0.92, both spans substantial (rejects thin bars / hands).
+5. If raw rectangularity is still &lt; 0.72: needs **fold evidence** or **strong** edge support; without fold, `quad_aspect` must be ≥ 1.55.
+6. Existing two-page merge still runs on **accepted** pages; inner quads inside an outer booklet are suppressed (`merged_two_page` / `large_document_outer` / `paper_region`).
+
+## 5. Rotated / skewed passports
+
+Axis-aligned bbox aspect is **not** the large-path accept test. Side-length aspect and `minAreaRect` / hull recovery do not require edges parallel to the image axes. Paper close is elliptical (not a horizontal-only kernel). Unit tests cover ~10° and ~25° rotation and a keystone warp.
+
+## 6. Oversized occupancy
+
+Normal `MAX_AREA_FRACTION` is unchanged. The large path allows recovered-quad occupancy up to **0.92** with evidence; **0.97+** contour blobs still die on the normal early reject. Slightly oversized fixtures (small margins) are unit-tested.
+
+## 7. Border contact
+
+`frame_aligned` means the recovered AABB spans **all four** image sides (the camera rectangle), not “two corners on a border”. One- or two-side clip (including top+bottom of 16:9) is allowed when the quad is still a booklet, not the frame.
+
+## 8. Full-frame false positives
+
+Rejected when: four-side span, or occupancy &gt; 0.92 with ≥3 sides, or a uniform full-frame fill. C3-class degenerates stay invalid.
+
+## 9. Distant rectangles
+
+Merge still requires height ratio, vertical overlap, and gap ≤ 12% of the thinner page. Two far cards fail `horizontal_gap`. Unit test unchanged.
+
+## 10. Why normal ID detection is unchanged
+
+Large-path constants are separate (`LARGE_*`). Landscape/portrait ID fixtures and `test_vision` geometry (empty table, hands, shadows, hold/smooth) still use the original hard filters on the normal path. Hands/shadows were used to tighten large-path span/aspect so they do **not** ride `large_document_outer`.
+
+## 11. Unit-test results
 
 ```text
 python -m pytest tests -q --tb=line
 ```
 
-**384 passed, 6 skipped** in 39.98 s (this environment, 2026-08-29).
+**404 passed, 6 skipped** (this environment, 2026-08-29). New coverage includes rotation, perspective, oversized, one/two-border clip, full-frame reject, random wide / rotated wide bars, fold = one document, low-raw-rect reject vs recovered-quad+fold accept, and frozen normal thresholds.
 
-New module `tests/unit/test_large_two_page_geometry.py`:
+## 12. Hardware validation results
 
-| Case | Test |
-|---|---|
-| A Normal single-page | `test_normal_single_page` |
-| B Small document | `test_small_document` |
-| C Large single-page | `test_large_single_page` |
-| D Very large | `test_very_large_document` + occupancy bands 25–82% |
-| E Opened two-page | `test_two_page_is_one_document` |
-| F Strong center seam | `test_strong_center_seam` |
-| G Uneven page brightness | `test_uneven_page_brightness` |
-| H Close to frame | `test_close_to_frame_boundaries` |
-| Clipped 16:9 preview | `test_vertically_clipped_opened_passport`, `test_clipped_page_without_drawn_border` |
-| I Large rect on table | page detected; empty wood not |
-| J Two unrelated side-by-side | `test_two_unrelated_rectangles_are_not_merged` (union IoU &lt; 0.55) |
-| AF ROI inside passport | `test_bbox_stays_inside_passport` |
+**Not performed in this environment.** Windows checkout cannot open the Arducam. After copying this `geometry.py` onto the Pi tree the debug script uses:
 
-Existing `tests/unit/test_vision.py` geometry cases still pass (empty table, hands, shadows, 40% IoU, hold/smooth).
+```bash
+sudo systemctl stop idcam
+sudo -u idcam /opt/idcam/venv/bin/python \
+  ~/Desktop/idCamV3/scripts/passport_detection_debug.py \
+  --save-dir /tmp --frames 5
+```
 
-## 4. Hardware status
+Required live cases: A normal open, B rotated, C keystone, D oversized, E one border, F two borders if practical, G empty / random wide. Success is `accepted≥1`, `best_mode` in `{merged_two_page, large_document_outer, paper_region}`, overlay **one** outer quad, `detector_reason != no_quadrilateral`.
 
-**PENDING** — Pi debug script (2026-08-29) proved CASE A on live preview (`docs/PASSPORT_DETECTION_RUNTIME_DEBUG.md`). Re-run that script after deploying this paper-region / `frame_aligned` change. Empty table, hands, and two distant rectangles remain unit-tested.
+## 13. Remaining limitations
 
-## 5. Status line
+- Paper mask still needs a darker table than the page; similar-luminance tables can miss the blob.
+- Strong 45°+ rotation can confuse `order_corners` (x+y heuristic); 10–30° is the tested band.
+- Merge of two pages is still AABB-based; a split rotated pair may rely on paper close + outer hull rather than merge.
+- Overlay bbox is axis-aligned; the **polyline** is the recovered quad.
+
+## Status line
 
 **PHASE 2 — LARGE DOCUMENT / TWO-PAGE DETECTION FIX**  
-Software status: **COMPLETE**  
-Hardware status: **PENDING**
+Software (unit): **PASSING**  
+Hardware: **PENDING — not COMPLETE**

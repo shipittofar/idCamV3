@@ -45,6 +45,18 @@ MERGE_MIN_ASPECT = 1.45
 MERGE_MAX_ASPECT = 3.45
 MERGE_MIN_AREA = 0.16
 
+# Dedicated open-passport / large-document path. Does not change the constants above.
+LARGE_MIN_AREA = 0.12
+LARGE_MAX_AREA = 0.92
+LARGE_MIN_QUAD_ASPECT = 1.12
+LARGE_MAX_QUAD_ASPECT = 4.20
+LARGE_MIN_EDGE_SUPPORT = 0.36
+LARGE_MIN_RIGHT = 0.42
+LARGE_MIN_CONFIDENCE = 0.42
+LARGE_MIN_SIDE_CONSISTENCY = 0.52
+LARGE_MIN_FOLD = 0.20
+LARGE_STRONG_EDGE = 0.52
+
 _last_reject_log_at = 0.0
 
 
@@ -60,6 +72,12 @@ class QuadCandidate:
     reason: str
     geometry_mode: str = "quad"
     border_distance: float = 0.0
+    edge_support: float = 0.0
+    quad_aspect: float = 0.0
+    border_sides: int = 0
+    rotation_angle: float = 0.0
+    perspective_score: float = 0.0
+    recovered_corner_source: str = ""
 
 
 def order_corners(points: np.ndarray) -> np.ndarray:
@@ -118,6 +136,112 @@ def _border_distance(corners: np.ndarray, width: int, height: int) -> float:
         ]
     )
     return float(np.min(d))
+
+
+def _quad_edge_lengths(corners: np.ndarray) -> tuple[float, float, float, float]:
+    pts = order_corners(corners)
+    top = float(np.linalg.norm(pts[1] - pts[0]))
+    right = float(np.linalg.norm(pts[2] - pts[1]))
+    bottom = float(np.linalg.norm(pts[2] - pts[3]))
+    left = float(np.linalg.norm(pts[3] - pts[0]))
+    return top, bottom, left, right
+
+
+def _quad_aspect_from_sides(corners: np.ndarray) -> float:
+    """Perspective-aware aspect: max(avg width, avg height) / min(...). Always >= 1."""
+    top, bottom, left, right = _quad_edge_lengths(corners)
+    width_est = 0.5 * (top + bottom)
+    height_est = 0.5 * (left + right)
+    short = min(width_est, height_est)
+    if short < 1.0:
+        return 0.0
+    return float(max(width_est, height_est) / short)
+
+
+def _side_consistency(corners: np.ndarray) -> float:
+    top, bottom, left, right = _quad_edge_lengths(corners)
+    tb = min(top, bottom) / max(top, bottom, 1.0)
+    lr = min(left, right) / max(left, right, 1.0)
+    return float(min(tb, lr))
+
+
+def _border_sides(corners: np.ndarray, width: int, height: int, *, px: float = 4.0) -> tuple[int, list[str]]:
+    pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
+    x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
+    names: list[str] = []
+    if x0 <= px:
+        names.append("left")
+    if x1 >= width - 1 - px:
+        names.append("right")
+    if y0 <= px:
+        names.append("top")
+    if y1 >= height - 1 - px:
+        names.append("bottom")
+    return len(names), names
+
+
+def _rotation_angle_deg(corners: np.ndarray) -> float:
+    pts = order_corners(corners)
+    v = pts[1] - pts[0]
+    return float(np.degrees(np.arctan2(float(v[1]), float(v[0]))))
+
+
+def _perspective_score(corners: np.ndarray) -> float:
+    cons = _side_consistency(corners)
+    right = _right_angle_score(corners)
+    return float(np.clip(0.55 * cons + 0.45 * right, 0.0, 1.0))
+
+
+def _edge_support_along_quad(edge: np.ndarray, corners: np.ndarray, *, samples: int = 28, band: int = 2) -> float:
+    if edge.size == 0:
+        return 0.0
+    h, w = edge.shape[:2]
+    pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    hits = 0
+    total = 0
+    for i in range(4):
+        a, b = pts[i], pts[(i + 1) % 4]
+        for t in np.linspace(0.06, 0.94, samples):
+            p = a * (1.0 - t) + b * t
+            x, y = int(round(float(p[0]))), int(round(float(p[1])))
+            x0, x1 = max(0, x - band), min(w, x + band + 1)
+            y0, y1 = max(0, y - band), min(h, y + band + 1)
+            total += 1
+            if x1 > x0 and y1 > y0 and int(edge[y0:y1, x0:x1].max()) > 0:
+                hits += 1
+    return float(hits / total) if total else 0.0
+
+
+def _fold_evidence(gray: np.ndarray, corners: np.ndarray) -> float:
+    """Dark band near the page midline (fold), in the recovered quad's coordinates."""
+    if gray.size == 0:
+        return 0.0
+    pts = order_corners(corners)
+    h, w = gray.shape[:2]
+    left_mid = 0.5 * (pts[0] + pts[3])
+    right_mid = 0.5 * (pts[1] + pts[2])
+    top_mid = 0.5 * (pts[0] + pts[1])
+    bot_mid = 0.5 * (pts[3] + pts[2])
+    interior: list[float] = []
+    fold_line: list[float] = []
+    for t in np.linspace(0.12, 0.88, 24):
+        for s in (0.22, 0.78):
+            p = (1 - s) * ((1 - t) * left_mid + t * right_mid) + s * ((1 - t) * top_mid + t * bot_mid)
+            x, y = int(round(float(p[0]))), int(round(float(p[1])))
+            if 0 <= x < w and 0 <= y < h:
+                interior.append(float(gray[y, x]))
+        q = (1 - t) * left_mid + t * right_mid
+        # vertical booklet fold: sample along height at horizontal center
+        c = (1 - t) * top_mid + t * bot_mid
+        for p in (q, c):
+            x, y = int(round(float(p[0]))), int(round(float(p[1])))
+            if 0 <= x < w and 0 <= y < h:
+                fold_line.append(float(gray[y, x]))
+    if len(interior) < 6 or len(fold_line) < 6:
+        return 0.0
+    delta = float(np.median(interior) - np.median(fold_line))
+    return float(np.clip(delta / 40.0, 0.0, 1.0))
 
 
 def _is_full_frame_quad(corners: np.ndarray, width: int, height: int, *, px: float = 4.0) -> bool:
@@ -225,21 +349,24 @@ def _paper_mask(gray: np.ndarray) -> np.ndarray:
 
     Illumination normalization flattens page/table brightness, so Canny-only
     search sees hollow outlines. A vertically clipped passport never closes.
-    Left/right border strips are used as the table reference (top/bottom may
-    be the document itself).
+    The darkest of the four border strips is the table reference so a document
+    that hits top/bottom still leaves left/right table samples (and vice versa).
     """
     h, w = gray.shape[:2]
-    margin = max(6, w // 80)
-    table = np.concatenate(
-        [gray[:, :margin].reshape(-1), gray[:, w - margin :].reshape(-1)]
-    )
-    ref = float(np.median(table))
+    mx = max(6, w // 80)
+    my = max(6, h // 80)
+    meds = [
+        float(np.median(gray[:, :mx])),
+        float(np.median(gray[:, w - mx :])),
+        float(np.median(gray[:my, :])),
+        float(np.median(gray[h - my :, :])),
+    ]
+    ref = min(meds)
     thr = ref + 28.0
     mask = (gray.astype(np.float32) > thr).astype(np.uint8) * 255
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    # Join a dark fold a few pixels wide without bridging distant objects.
-    k_fold = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 7))
+    k_fold = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_fold, iterations=1)
     return mask
 
@@ -316,9 +443,11 @@ def _build_candidate(
     corners = clip_corners(corners, src_width, src_height)
     bbox = bbox_from_corners(corners)
     border = _border_distance(corners, src_width, src_height)
+    n_sides, side_names = _border_sides(corners, src_width, src_height, px=4.0)
+    quad_aspect = _quad_aspect_from_sides(corners)
     cid = candidate_id or (trace.next_id() if trace is not None else "")  # type: ignore[union-attr]
 
-    def _emit(accepted: bool, reason: str) -> None:
+    def _emit(accepted: bool, reason: str, **extra: object) -> None:
         if log_reject and not accepted:
             _maybe_log_reject(
                 reason=reason,
@@ -350,7 +479,14 @@ def _build_candidate(
             "accepted": accepted,
             "geometry_mode": geometry_mode,
             "candidate_edge_score": right,
+            "quad_aspect": quad_aspect,
+            "quad_area_ratio": area_ratio,
+            "border_contact": n_sides,
+            "border_sides": side_names,
+            "large_document_candidate": False,
+            "recovered_quad": corners.tolist(),
         }
+        rec.update(extra)
         trace.record_candidate(rec)  # type: ignore[union-attr]
 
     def _reject(reason: str) -> None:
@@ -386,6 +522,179 @@ def _build_candidate(
     )
 
 
+def _build_large_document_candidate(
+    corners_work: np.ndarray,
+    contour_area: float,
+    work_area: float,
+    min_rect_area: float,
+    scale: float,
+    src_width: int,
+    src_height: int,
+    work_gray: np.ndarray,
+    edge_map: np.ndarray,
+    recovered_source: str,
+    *,
+    log_reject: bool,
+    trace: object | None = None,
+    candidate_id: str = "",
+) -> QuadCandidate | None:
+    """Accept a recovered outer quad when raw contour rectangularity is low.
+
+    Normal ``MIN_RECTANGULARITY`` is not used as a hard gate. Full-frame and
+    weak-evidence blobs are still rejected.
+    """
+    corners_work = order_corners(corners_work)
+    corners = clip_corners(corners_work / float(scale), src_width, src_height)
+    bbox = bbox_from_corners(corners)
+    border = _border_distance(corners, src_width, src_height)
+    n_sides, side_names = _border_sides(corners, src_width, src_height, px=4.0)
+    quad_aspect = _quad_aspect_from_sides(corners)
+    right = _right_angle_score(corners_work)
+    cons = _side_consistency(corners_work)
+    edge_s = _edge_support_along_quad(edge_map, corners_work)
+    fold = _fold_evidence(work_gray, corners_work)
+    persp = _perspective_score(corners_work)
+    rot = _rotation_angle_deg(corners)
+    raw_rect = float(np.clip(contour_area / min_rect_area if min_rect_area > 1 else 0.0, 0.0, 1.0))
+    quad_poly = float(cv2.contourArea(corners_work.astype(np.float32)))
+    mr = cv2.minAreaRect(corners_work.astype(np.float32))
+    mra = max(1.0, float(mr[1][0]) * float(mr[1][1]))
+    quad_rect = float(np.clip(quad_poly / mra, 0.0, 1.0))
+    frame_area = float(max(src_width * src_height, 1))
+    quad_area_ratio = float(cv2.contourArea(corners.astype(np.float32)) / frame_area)
+    wh_aspect = _aspect_of_quad(corners_work)
+    conf = float(
+        np.clip(
+            0.28 * right
+            + 0.22 * edge_s
+            + 0.18 * _area_term(quad_area_ratio)
+            + 0.14 * _aspect_term(wh_aspect)
+            + 0.10 * fold
+            + 0.08 * quad_rect,
+            0.0,
+            1.0,
+        )
+    )
+    cid = candidate_id or (trace.next_id() if trace is not None else "")  # type: ignore[union-attr]
+    extras = {
+        "large_document_candidate": True,
+        "recovered_corner_source": recovered_source,
+        "recovered_quad": corners.tolist(),
+        "quad_aspect": quad_aspect,
+        "quad_area_ratio": quad_area_ratio,
+        "edge_support": edge_s,
+        "border_contact": n_sides,
+        "border_sides": side_names,
+        "perspective_score": persp,
+        "rotation_angle": rot,
+        "outer_quad_reconstruction": True,
+        "fold_evidence": fold,
+        "raw_rectangularity": raw_rect,
+        "side_consistency": cons,
+    }
+
+    def _emit(accepted: bool, reason: str) -> None:
+        if log_reject and not accepted:
+            _maybe_log_reject(
+                reason=reason,
+                area_ratio=quad_area_ratio,
+                bbox=bbox,
+                aspect_ratio=quad_aspect,
+                rectangularity=raw_rect,
+                corner_count=4,
+                right_angle=right,
+                border_distance=border,
+            )
+        if trace is None:
+            return
+        rec = {
+            "candidate_id": cid,
+            "bbox": bbox,
+            "x": bbox[0],
+            "y": bbox[1],
+            "width": bbox[2],
+            "height": bbox[3],
+            "area": float(contour_area),
+            "area_ratio": quad_area_ratio,
+            "aspect_ratio": wh_aspect,
+            "rectangularity": raw_rect,
+            "corner_count": 4,
+            "confidence": conf,
+            "border_distance": border,
+            "rejection_reason": "" if accepted else reason,
+            "accepted": accepted,
+            "geometry_mode": "large_document_outer",
+            "candidate_edge_score": right,
+            "large_document_rejection_reason": "" if accepted else reason,
+        }
+        rec.update(extras)
+        trace.record_candidate(rec)  # type: ignore[union-attr]
+
+    if _is_full_frame_quad(corners, src_width, src_height, px=6.0) or n_sides >= 4:
+        _emit(False, "frame_aligned")
+        return None
+    if quad_area_ratio > LARGE_MAX_AREA and n_sides >= 3:
+        _emit(False, "frame_aligned")
+        return None
+    if quad_area_ratio < LARGE_MIN_AREA:
+        _emit(False, "large_area_too_small")
+        return None
+    if quad_area_ratio > LARGE_MAX_AREA:
+        _emit(False, "large_area_too_large")
+        return None
+    if quad_aspect < LARGE_MIN_QUAD_ASPECT or quad_aspect > LARGE_MAX_QUAD_ASPECT:
+        _emit(False, "large_aspect_out_of_range")
+        return None
+    top, bottom, left, right = _quad_edge_lengths(corners)
+    width_est = 0.5 * (top + bottom)
+    height_est = 0.5 * (left + right)
+    min_span = min(width_est, height_est)
+    max_span = max(width_est, height_est)
+    if min_span < 0.28 * min(src_width, src_height):
+        _emit(False, "large_too_thin")
+        return None
+    if max_span < 0.30 * max(src_width, src_height):
+        _emit(False, "large_span_too_small")
+        return None
+    if fold < LARGE_MIN_FOLD and quad_aspect < 1.55:
+        _emit(False, "large_aspect_out_of_range")
+        return None
+    if cons < LARGE_MIN_SIDE_CONSISTENCY:
+        _emit(False, "large_side_inconsistent")
+        return None
+    if right < LARGE_MIN_RIGHT:
+        _emit(False, "large_low_right_angle")
+        return None
+    if edge_s < LARGE_MIN_EDGE_SUPPORT:
+        _emit(False, "large_weak_edge_support")
+        return None
+    if raw_rect < MIN_RECTANGULARITY and fold < LARGE_MIN_FOLD and edge_s < LARGE_STRONG_EDGE:
+        _emit(False, "large_low_evidence")
+        return None
+    if conf < LARGE_MIN_CONFIDENCE:
+        _emit(False, "large_below_confidence")
+        return None
+    _emit(True, "")
+    return QuadCandidate(
+        corners=corners,
+        bbox=bbox,
+        confidence=conf,
+        area_ratio=quad_area_ratio,
+        aspect_ratio=wh_aspect,
+        rectangularity=max(raw_rect, quad_rect),
+        right_angle=right,
+        reason="large_document_outer",
+        geometry_mode="large_document_outer",
+        border_distance=border,
+        edge_support=edge_s,
+        quad_aspect=quad_aspect,
+        border_sides=n_sides,
+        rotation_angle=rot,
+        perspective_score=persp,
+        recovered_corner_source=recovered_source,
+    )
+
+
 def _candidate_from_contour(
     contour: np.ndarray,
     work_shape: tuple[int, int],
@@ -398,6 +707,8 @@ def _candidate_from_contour(
     force_min_rect: bool = False,
     area_from_hull: bool = False,
     geometry_mode: str | None = None,
+    work_gray: np.ndarray | None = None,
+    edge_map: np.ndarray | None = None,
 ) -> QuadCandidate | None:
     fh, fw = int(work_shape[0]), int(work_shape[1])
     work_area = float(fh * fw)
@@ -453,13 +764,22 @@ def _candidate_from_contour(
         return None
     allow_min_rect = force_min_rect or (0.20 <= area_frac <= 0.85)
     quad, mode, n_pts = _approx_quad(contour, allow_min_rect=allow_min_rect)
+    recovered = "hull_approx" if mode == "quad" else "min_rect"
+    if quad is None and area_frac >= LARGE_MIN_AREA:
+        quad, mode, n_pts = _approx_quad(contour, allow_min_rect=True)
+        recovered = "min_rect"
     if quad is None:
         _early(mode, corners_n=n_pts)
         return None
     hull_quad = cv2.convexHull(quad.astype(np.float32))
     if len(hull_quad) != 4:
-        _early("hull_not_quad", corners_n=int(len(hull_quad)))
-        return None
+        if area_frac >= LARGE_MIN_AREA:
+            quad, mode, n_pts = _approx_quad(contour, allow_min_rect=True)
+            recovered = "min_rect"
+            hull_quad = cv2.convexHull(quad.astype(np.float32)) if quad is not None else hull_quad
+        if quad is None or len(hull_quad) != 4:
+            _early("hull_not_quad", corners_n=int(len(hull_quad)))
+            return None
     rect = cv2.minAreaRect(contour)
     rw, rh = float(rect[1][0]), float(rect[1][1])
     min_rect_area = max(1.0, rw * rh)
@@ -468,7 +788,7 @@ def _candidate_from_contour(
     else:
         geom_mode = "min_rect_fallback" if mode == "min_rect_fallback" else "quad"
     cid = trace.next_id() if trace is not None else ""  # type: ignore[union-attr]
-    return _build_candidate(
+    normal = _build_candidate(
         order_corners(quad),
         area,
         work_area,
@@ -480,6 +800,26 @@ def _candidate_from_contour(
         log_reject=log_reject,
         trace=trace,
         candidate_id=cid,
+    )
+    if normal is not None:
+        return normal
+    if work_gray is None or edge_map is None:
+        return None
+    large_id = trace.next_id() if trace is not None else ""  # type: ignore[union-attr]
+    return _build_large_document_candidate(
+        order_corners(quad),
+        area,
+        work_area,
+        min_rect_area,
+        scale,
+        src_width,
+        src_height,
+        work_gray,
+        edge_map,
+        recovered,
+        log_reject=log_reject,
+        trace=trace,
+        candidate_id=large_id,
     )
 
 
@@ -502,7 +842,10 @@ def _suppress_inner_quads(candidates: list[QuadCandidate], trace: object | None 
         for j, outer in enumerate(candidates):
             if i == j:
                 continue
-            if outer.geometry_mode != "merged_two_page" and outer.area_ratio < inner.area_ratio * 1.75:
+            if (
+                outer.geometry_mode not in {"merged_two_page", "large_document_outer", "paper_region"}
+                and outer.area_ratio < inner.area_ratio * 1.75
+            ):
                 continue
             if _bbox_containment_frac(inner.bbox, outer.bbox) >= 0.88:
                 keep[i] = False
@@ -649,7 +992,9 @@ def _merge_two_page_candidates(
 
 
 def _rank_key(cand: QuadCandidate) -> tuple[float, float]:
-    booklet = 0.04 if cand.geometry_mode == "merged_two_page" else 0.0
+    booklet = 0.04 if cand.geometry_mode in {"merged_two_page", "large_document_outer"} else 0.0
+    if cand.geometry_mode == "paper_region":
+        booklet = 0.02
     # Prefer a true page inset from the frame over a quad that swallowed the margin.
     flush = 0.06 if cand.border_distance < 2.5 else 0.0
     return (cand.confidence + booklet - flush, cand.border_distance)
@@ -702,6 +1047,8 @@ def find_document_quad(frame: np.ndarray, *, trace: object | None = None) -> tup
                 src_h,
                 log_reject=not candidates,
                 trace=trace,
+                work_gray=work,
+                edge_map=edge_combo,
             )
             if cand is None:
                 continue
@@ -711,7 +1058,15 @@ def find_document_quad(frame: np.ndarray, *, trace: object | None = None) -> tup
             seen.add(key)
             candidates.append(cand)
 
-    for edge in _edge_maps(norm):
+    edge_maps = _edge_maps(norm)
+    edge_combo = np.zeros(work.shape[:2], dtype=np.uint8)
+    for edge in edge_maps:
+        edge_combo = cv2.bitwise_or(edge_combo, edge)
+    edge_combo = cv2.bitwise_or(
+        edge_combo, cv2.Canny(cv2.GaussianBlur(work, (5, 5), 0), 40, 120)
+    )
+
+    for edge in edge_maps:
         _add_from_edges(edge, close_kernel=kernel, iterations=2)
 
     paper = _paper_mask(work)
@@ -728,6 +1083,8 @@ def find_document_quad(frame: np.ndarray, *, trace: object | None = None) -> tup
             force_min_rect=True,
             area_from_hull=True,
             geometry_mode="paper_region",
+            work_gray=work,
+            edge_map=edge_combo,
         )
         if cand is None:
             continue

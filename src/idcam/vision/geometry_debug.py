@@ -50,9 +50,14 @@ def effective_geometry_config() -> dict[str, Any]:
         "MERGE_MIN_ASPECT": geom.MERGE_MIN_ASPECT,
         "MERGE_MAX_ASPECT": geom.MERGE_MAX_ASPECT,
         "MERGE_MIN_AREA": geom.MERGE_MIN_AREA,
+        "LARGE_MIN_AREA": geom.LARGE_MIN_AREA,
+        "LARGE_MAX_AREA": geom.LARGE_MAX_AREA,
+        "LARGE_MIN_QUAD_ASPECT": geom.LARGE_MIN_QUAD_ASPECT,
+        "LARGE_MAX_QUAD_ASPECT": geom.LARGE_MAX_QUAD_ASPECT,
         "geometry_module": getattr(geom, "__file__", None),
         "has_merged_two_page": hasattr(geom, "_try_merge_two_page"),
         "has_suppress_inner": hasattr(geom, "_suppress_inner_quads"),
+        "has_large_document": hasattr(geom, "_build_large_document_candidate"),
     }
 
 
@@ -258,6 +263,13 @@ def diagnose_frame(frame: np.ndarray) -> GeometryTrace:
             "rejection_reason": "",
             "rectangularity": best.rectangularity,
             "border_distance": best.border_distance,
+            "quad_aspect": best.quad_aspect,
+            "edge_support": best.edge_support,
+            "border_sides": best.border_sides,
+            "perspective_score": best.perspective_score,
+            "rotation_angle": best.rotation_angle,
+            "recovered_corner_source": best.recovered_corner_source,
+            "large_document_candidate": best.geometry_mode == "large_document_outer",
         }
     return trace
 

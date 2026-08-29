@@ -8,7 +8,19 @@ import pytest
 
 from idcam.config.schema import DetectionConfig
 from idcam.vision.document_detector import DocumentDetector
-from idcam.vision.geometry import bbox_iou, find_document_quad
+from idcam.vision.geometry import (
+    MAX_AREA_FRACTION,
+    MAX_ASPECT,
+    MIN_AREA_FRACTION,
+    MIN_ASPECT,
+    MIN_CONFIDENCE,
+    MIN_RECTANGULARITY,
+    MIN_RIGHT_ANGLE,
+    _build_large_document_candidate,
+    bbox_iou,
+    find_document_quad,
+    order_corners,
+)
 
 
 @pytest.fixture
@@ -151,7 +163,13 @@ class TestOpenedPassport:
         assert bbox_iou(geom.bbox, box) > 0.65
         raw, _n = find_document_quad(frame)
         assert raw is not None
-        assert raw.geometry_mode in {"quad", "merged_two_page", "min_rect_fallback"}
+        assert raw.geometry_mode in {
+            "quad",
+            "merged_two_page",
+            "min_rect_fallback",
+            "paper_region",
+            "large_document_outer",
+        }
 
     def test_uneven_page_brightness(self, detection_config):
         box = (90, 100, 1500, 740)
@@ -186,7 +204,13 @@ class TestOpenedPassport:
         assert geom.present is True
         assert geom.bbox is not None
         assert bbox_iou(geom.bbox, box) > 0.55
-        assert geom.geometry_mode in ("paper_region", "min_rect_fallback", "quad", "merged_two_page")
+        assert geom.geometry_mode in (
+            "paper_region",
+            "min_rect_fallback",
+            "quad",
+            "merged_two_page",
+            "large_document_outer",
+        )
 
 
 class TestNegatives:
@@ -224,3 +248,182 @@ class TestAfRoiCompatibility:
         assert rx + rw <= box[0] + box[2] + 30
         assert ry + rh <= box[1] + box[3] + 30
         assert rw * rh > 0.4 * box[2] * box[3]
+
+
+_PASSPORT_MODES = {
+    "quad",
+    "merged_two_page",
+    "min_rect_fallback",
+    "paper_region",
+    "large_document_outer",
+}
+
+
+def _rotate_frame(img: np.ndarray, angle_deg: float) -> np.ndarray:
+    h, w = img.shape[:2]
+    matrix = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
+    return cv2.warpAffine(img, matrix, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def _perspective_warp_box(img: np.ndarray, box: tuple[int, int, int, int], *, skew: int = 90) -> np.ndarray:
+    h, w = img.shape[:2]
+    x, y, pw, ph = box
+    src = np.float32([[x, y], [x + pw, y], [x + pw, y + ph], [x, y + ph]])
+    dst = np.float32(
+        [
+            [x + skew, y + 12],
+            [x + pw - skew // 3, y - 8],
+            [x + pw + 10, y + ph - 18],
+            [x + 16, y + ph + 8],
+        ]
+    )
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, matrix, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+
+class TestNormalThresholdsUnchanged:
+    def test_hard_filters_are_the_published_values(self):
+        assert MIN_AREA_FRACTION == 0.08
+        assert MAX_AREA_FRACTION == 0.97
+        assert MIN_ASPECT == 0.40
+        assert MAX_ASPECT == 3.35
+        assert MIN_RECTANGULARITY == 0.72
+        assert MIN_CONFIDENCE == 0.48
+        assert MIN_RIGHT_ANGLE == 0.55
+
+    def test_landscape_id_still_detected(self, detection_config):
+        geom = DocumentDetector(detection_config).detect_geometry(_page((480, 640), (80, 60, 480, 360)))
+        assert geom.present is True
+
+    def test_portrait_document_still_detected(self, detection_config):
+        geom = DocumentDetector(detection_config).detect_geometry(_page((480, 640), (210, 30, 220, 420)))
+        assert geom.present is True
+
+
+class TestRotatedAndSkewedPassport:
+    def test_open_passport_rotated_10_deg(self, detection_config):
+        box = (220, 200, 1480, 680)
+        frame = _rotate_frame(_opened_passport((1080, 1920), box, seam_px=8), 10)
+        geom = DocumentDetector(detection_config).detect_geometry(frame)
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert geom.bbox[2] > 900
+        raw, _n = find_document_quad(frame)
+        assert raw is not None
+        assert raw.geometry_mode in _PASSPORT_MODES
+
+    def test_open_passport_rotated_25_deg(self, detection_config):
+        box = (280, 230, 1360, 620)
+        frame = _rotate_frame(_opened_passport((1080, 1920), box, seam_px=8), 25)
+        geom = DocumentDetector(detection_config).detect_geometry(frame)
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert max(geom.bbox[2], geom.bbox[3]) > 700
+        raw, _n = find_document_quad(frame)
+        assert raw is not None
+        assert raw.geometry_mode in _PASSPORT_MODES
+
+    def test_perspective_skewed_open_passport(self, detection_config):
+        box = (160, 160, 1500, 720)
+        frame = _perspective_warp_box(_opened_passport((1080, 1920), box, seam_px=8), box, skew=110)
+        geom = DocumentDetector(detection_config).detect_geometry(frame)
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert geom.bbox[2] > 800
+
+
+class TestOversizedAndBorderContact:
+    def test_slightly_oversized_passport(self, detection_config):
+        box = (20, 12, 1880, 1054)
+        geom = DocumentDetector(detection_config).detect_geometry(_opened_passport((1080, 1920), box, seam_px=8))
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert geom.bbox[2] > 1200
+
+    def test_passport_touching_one_border(self, detection_config):
+        box = (180, 0, 1480, 820)
+        geom = DocumentDetector(detection_config).detect_geometry(_opened_passport((1080, 1920), box, seam_px=8))
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert geom.bbox[1] <= 8
+
+    def test_passport_touching_two_borders(self, detection_config):
+        box = (0, 0, 1500, 900)
+        geom = DocumentDetector(detection_config).detect_geometry(_opened_passport((1080, 1920), box, seam_px=8))
+        assert geom.present is True
+        assert geom.bbox is not None
+        assert geom.bbox[2] > 900
+
+
+class TestLargeDocumentNegatives:
+    def test_full_frame_rectangle_rejected(self, detection_config):
+        frame = np.full((1080, 1920, 3), 242, dtype=np.uint8)
+        geom = DocumentDetector(detection_config).detect_geometry(frame)
+        assert geom.present is False
+
+    def test_random_wide_rectangle_rejected(self, detection_config):
+        img = _wood_table((1080, 1920))
+        img[440:660, 50:1870] = (242, 238, 230)
+        geom = DocumentDetector(detection_config).detect_geometry(img)
+        assert geom.present is False
+
+    def test_random_rotated_wide_rectangle_rejected(self, detection_config):
+        img = _wood_table((1080, 1920))
+        img[450:670, 70:1850] = (242, 238, 230)
+        geom = DocumentDetector(detection_config).detect_geometry(_rotate_frame(img, 18))
+        assert geom.present is False
+
+    def test_fold_does_not_split_into_two_documents(self, detection_config):
+        box = (100, 140, 1500, 700)
+        frame = _opened_passport((1080, 1920), box, seam_px=16)
+        raw, count = find_document_quad(frame)
+        assert raw is not None
+        assert raw.geometry_mode in _PASSPORT_MODES
+        geom = DocumentDetector(detection_config).detect_geometry(frame)
+        assert geom.present is True
+        assert geom.bbox[2] > box[2] * 0.65
+
+
+class TestLargeDocumentEvidenceGates:
+    def test_low_raw_rectangularity_alone_is_rejected(self):
+        corners = order_corners(np.array([[80.0, 80.0], [880.0, 80.0], [880.0, 500.0], [80.0, 500.0]]))
+        gray = np.full((540, 960), 140, dtype=np.uint8)
+        edges = np.zeros((540, 960), dtype=np.uint8)
+        cand = _build_large_document_candidate(
+            corners,
+            contour_area=8000.0,
+            work_area=540.0 * 960.0,
+            min_rect_area=800.0 * 420.0,
+            scale=0.5,
+            src_width=1920,
+            src_height=1080,
+            work_gray=gray,
+            edge_map=edges,
+            recovered_source="min_rect",
+            log_reject=False,
+        )
+        assert cand is None
+
+    def test_recovered_quad_with_fold_and_edges_can_accept(self):
+        corners = order_corners(np.array([[80.0, 80.0], [880.0, 90.0], [870.0, 500.0], [90.0, 490.0]]))
+        gray = np.full((540, 960), 210, dtype=np.uint8)
+        gray[:, 470:490] = 40
+        edges = np.zeros((540, 960), dtype=np.uint8)
+        pts = corners.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(edges, [pts], True, 255, 3)
+        cand = _build_large_document_candidate(
+            corners,
+            contour_area=8000.0,
+            work_area=540.0 * 960.0,
+            min_rect_area=800.0 * 420.0,
+            scale=0.5,
+            src_width=1920,
+            src_height=1080,
+            work_gray=gray,
+            edge_map=edges,
+            recovered_source="min_rect",
+            log_reject=False,
+        )
+        assert cand is not None
+        assert cand.geometry_mode == "large_document_outer"
+        assert cand.quad_aspect >= 1.12
