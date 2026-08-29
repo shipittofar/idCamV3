@@ -38,6 +38,7 @@ def app_config(tmp_path):
             removal_frames_required=2,
             geometry_stable_frames_required=2,
             geometry_stability_threshold_px=12.0,
+            geometry_smooth_alpha=1.0,
         ),
         camera=CameraConfig(preview_fps=30.0, af_timeout_sec=1.0, af_max_retries=1, af_verify_max_retries=2),
         ui=UIConfig(
@@ -490,6 +491,7 @@ class TestStabilityGate:
         orch = _orch(app_config)
         orch.sm.state = AppState.WAITING_FOR_STABILITY
         orch._transaction = ActiveCaptureTransaction(capture_id="cap-1")
+        orch._stability_latched = True
         still = _document_frame(box=(80, 60, 480, 360))
         moved = _document_frame(box=(200, 160, 360, 260))
         orch._safe_preview = AsyncMock(side_effect=[still, moved, still, moved, still, moved])

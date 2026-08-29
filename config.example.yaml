@@ -63,8 +63,9 @@ detection:
   geometry_hold_frames: 3
   geometry_smooth_alpha: 0.40
   geometry_stability_threshold_px: 12.0
+  geometry_stability_relative: 0.05
   geometry_stable_frames_required: 5
-  geometry_stability_miss_tolerance: 1
+  geometry_stability_miss_tolerance: 2
 
 quality:
   min_sharpness: 80.0

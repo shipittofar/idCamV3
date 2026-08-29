@@ -30,6 +30,9 @@ class TestConfigSchema:
         config = AppConfig.model_validate(valid_config_dict)
         assert config.device_id == "test-device"
         assert str(config.server.url) == "https://api.example.com/"
+        assert config.detection.geometry_stability_relative == 0.05
+        assert config.detection.geometry_stability_miss_tolerance == 2
+        assert config.detection.removal_frames_required == 4
 
     def test_missing_device_id(self, valid_config_dict):
         del valid_config_dict["device_id"]

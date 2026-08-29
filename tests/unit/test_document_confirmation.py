@@ -198,6 +198,32 @@ async def _assert_auto_if_geometry(orch, frame, app_config):
     assert orch._transaction is None
 
 
+async def _assert_reaches_focusing(orch, frame, app_config):
+    """Geometry present must be able to leave WAITING_FOR_STABILITY into FOCUSING."""
+    present = DocumentDetector(app_config.detection).detect_geometry(frame).present
+    orch._safe_preview = AsyncMock(return_value=frame)
+    if not present:
+        for _ in range(12):
+            await orch._idle_tick()
+        assert orch.sm.state == AppState.IDLE
+        assert orch._transaction is None
+        return
+    await _idle_until_auto(orch)
+    assert orch.sm.state == AppState.DOCUMENT_DETECTED
+    await orch._document_detected_tick()
+    assert orch.sm.state == AppState.WAITING_FOR_STABILITY
+    for _ in range(16):
+        if orch.sm.state == AppState.FOCUSING:
+            break
+        await orch._stability_tick()
+    assert orch.sm.state == AppState.FOCUSING, (
+        f"stable geometry did not start autofocus; state={orch.sm.state} "
+        f"count={orch.geometry_stability.stable_count} "
+        f"disp={orch.geometry_stability.last_displacement_px:.2f} "
+        f"thr={orch.geometry_stability.last_effective_threshold_px:.2f}"
+    )
+
+
 class TestGeometryGatesUnchanged:
     def test_normal_thresholds_frozen(self):
         assert MIN_AREA_FRACTION == 0.08
@@ -520,15 +546,15 @@ class TestAutoCaptureGuards:
 async def test_auto_capture_placement_matrix(app_config, label, box):
     orch = _orch(app_config)
     orch.sm.state = AppState.IDLE
-    await _assert_auto_if_geometry(orch, _id_card(box=box, printed=True), app_config)
+    await _assert_reaches_focusing(orch, _id_card(box=box, printed=True), app_config)
 
 
-@pytest.mark.parametrize("angle", [0, 20, 45, 60, 90])
+@pytest.mark.parametrize("angle", [0, 20, 45, 60, 90, -15, 33, 75])
 @pytest.mark.asyncio
 async def test_auto_capture_rotation_matrix(app_config, angle):
     orch = _orch(app_config)
     orch.sm.state = AppState.IDLE
-    await _assert_auto_if_geometry(orch, _id_card(angle=angle, printed=True), app_config)
+    await _assert_reaches_focusing(orch, _id_card(angle=angle, printed=True), app_config)
 
 
 @pytest.mark.parametrize(
@@ -544,7 +570,7 @@ async def test_auto_capture_rotation_matrix(app_config, angle):
 async def test_auto_capture_size_matrix(app_config, label, box):
     orch = _orch(app_config)
     orch.sm.state = AppState.IDLE
-    await _assert_auto_if_geometry(orch, _id_card(box=box, printed=True), app_config)
+    await _assert_reaches_focusing(orch, _id_card(box=box, printed=True), app_config)
 
 
 @pytest.mark.parametrize("n_borders", [0, 1, 2, 3])
@@ -561,7 +587,7 @@ async def test_auto_capture_border_contact_matrix(app_config, n_borders):
         frame = _id_card((h, w), (0, 0, 420, 280), printed=True)
     else:
         frame = _id_card((h, w), (0, 0, w, 300), printed=True)
-    await _assert_auto_if_geometry(orch, frame, app_config)
+    await _assert_reaches_focusing(orch, frame, app_config)
 
 
 @pytest.mark.parametrize(

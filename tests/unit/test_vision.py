@@ -15,7 +15,7 @@ from idcam.vision.document_detector import (
 from idcam.vision.geometry import bbox_from_corners, bbox_iou, order_corners
 from idcam.vision.sharpness import laplacian_variance, mean_brightness
 from idcam.vision.document_detector import DocumentDetector
-from idcam.vision.geometry_stability import GeometryStability, mean_corner_displacement_px
+from idcam.vision.geometry_stability import GeometryStability, matched_corner_displacement_px, mean_corner_displacement_px
 from idcam.vision.stability_detector import StabilityDetector
 
 
@@ -469,7 +469,7 @@ class TestGeometryStability:
         assert gate.stable_count >= 2
 
     def test_moving_quad_resets_counter(self, detection_config):
-        gate = GeometryStability(threshold_px=12.0, frames_required=3)
+        gate = GeometryStability(threshold_px=12.0, frames_required=3, miss_tolerance=1)
         detector = DocumentDetector(detection_config)
         a = detector.detect_geometry(_page_on_table((480, 640), (40, 40, 480, 360)))
         b = detector.detect_geometry(_page_on_table((480, 640), (120, 80, 480, 360)))
@@ -486,7 +486,7 @@ class TestGeometryStability:
         assert gate.update(c) is False
 
     def test_absent_resets(self, detection_config):
-        gate = GeometryStability(threshold_px=12.0, frames_required=2)
+        gate = GeometryStability(threshold_px=12.0, frames_required=2, miss_tolerance=1)
         detector = DocumentDetector(detection_config)
         page = _page_on_table((480, 640), (80, 60, 480, 360))
         gate.update(detector.detect_geometry(page))
@@ -498,6 +498,34 @@ class TestGeometryStability:
         assert gate.stable_count >= 1
         gate.update(absent)
         assert gate.stable_count == 0
+
+    def test_matched_displacement_ignores_start_vertex_flip(self):
+        square = np.array([[10.0, 10.0], [110.0, 10.0], [110.0, 110.0], [10.0, 110.0]], dtype=np.float32)
+        rolled = np.roll(square, 1, axis=0)
+        assert float(np.mean(np.linalg.norm(rolled - square, axis=1))) > 50.0
+        assert matched_corner_displacement_px(square, rolled) < 1.0
+
+    def test_relative_budget_tolerates_percent_jitter(self):
+        gate = GeometryStability(threshold_px=12.0, frames_required=2, miss_tolerance=0, relative_fraction=0.05)
+        # ~400 px sides → 5% = 20 px > 12
+        a = np.array([[50.0, 50.0], [450.0, 50.0], [450.0, 350.0], [50.0, 350.0]], dtype=np.float32)
+        b = a + np.array([[16.0, 4.0], [16.0, -3.0], [15.0, 5.0], [17.0, -2.0]], dtype=np.float32)
+        geom_a = DocumentGeometryResult(present=True, confidence=1.0, corners=tuple(map(tuple, a)), bbox=(50, 50, 400, 300), reason="ok")
+        geom_b = DocumentGeometryResult(present=True, confidence=1.0, corners=tuple(map(tuple, b)), bbox=(66, 47, 400, 300), reason="ok")
+        assert gate.update(geom_a) is False
+        assert gate.update(geom_b) is False
+        assert gate.stable_count == 1
+        assert gate.last_same_document is True
+
+    def test_vertex_flip_does_not_reset_stability(self):
+        gate = GeometryStability(threshold_px=12.0, frames_required=2, miss_tolerance=0)
+        square = np.array([[10.0, 10.0], [110.0, 10.0], [110.0, 110.0], [10.0, 110.0]], dtype=np.float32)
+        rolled = np.roll(square, 1, axis=0)
+        ga = DocumentGeometryResult(present=True, confidence=1.0, corners=tuple(map(tuple, square)), bbox=(10, 10, 100, 100), reason="ok")
+        gb = DocumentGeometryResult(present=True, confidence=1.0, corners=tuple(map(tuple, rolled)), bbox=(10, 10, 100, 100), reason="ok")
+        assert gate.update(ga) is False
+        assert gate.update(gb) is False
+        assert gate.stable_count == 1
 
 
 class TestSharpness:

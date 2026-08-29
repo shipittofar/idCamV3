@@ -44,8 +44,8 @@ from idcam.system.watchdog import Watchdog
 from idcam.ui.status import StatusPublisher
 from idcam.vision.document_confirmation import DocumentConfirmationTracker
 from idcam.vision.document_detector import DocumentDetector, DocumentGeometryResult
-from idcam.vision.geometry import find_document_quad
-from idcam.vision.geometry_stability import GeometryStability, mean_corner_displacement_px
+from idcam.vision.geometry import bbox_from_corners, bbox_iou, find_document_quad
+from idcam.vision.geometry_stability import GeometryStability, matched_corner_displacement_px
 from idcam.vision.sharpness import clip_roi
 
 logger = get_logger("orchestrator")
@@ -105,6 +105,7 @@ class ApplicationOrchestrator:
             threshold_px=config.detection.geometry_stability_threshold_px,
             frames_required=config.detection.geometry_stable_frames_required,
             miss_tolerance=config.detection.geometry_stability_miss_tolerance,
+            relative_fraction=config.detection.geometry_stability_relative,
         )
         self.document_confirmation = DocumentConfirmationTracker(
             frames_required=config.detection.geometry_stable_frames_required,
@@ -127,6 +128,7 @@ class ApplicationOrchestrator:
         self._manual_focus = None
         self._idle_reject_count = 0
         self._last_geometry_status = ""
+        self._last_block_key: tuple | None = None
         self._accepted_geometry: DocumentGeometryResult | None = None
         self._cmd_lock = threading.Lock()
         self._pending_command: str | None = None
@@ -483,13 +485,17 @@ class ApplicationOrchestrator:
                 )
                 return False, 0.0
             return True, float("inf")
-        displacement = mean_corner_displacement_px(previous, raw.corners)
-        moved = displacement > self.geometry_stability.threshold_px
+        displacement = matched_corner_displacement_px(previous, raw.corners)
+        thr = self.geometry_stability.effective_threshold_px(previous)
+        moved = displacement > thr
         logger.info(
-            "event=geometry_motion_check result=%s displacement_px=%.2f displacement_threshold_px=%.2f",
+            "event=geometry_motion_check result=%s displacement_px=%.2f displacement_threshold_px=%.2f "
+            "rotation_deg=%.1f border_contacts=%d",
             "moved" if moved else "ok",
             displacement,
-            self.geometry_stability.threshold_px,
+            thr,
+            float(geom.rotation_deg),
+            int(geom.border_sides),
         )
         return moved, displacement
 
@@ -501,7 +507,8 @@ class ApplicationOrchestrator:
         logger.info(
             "event=geometry_gate status=%s geometry_present=%s geometry_stable=%s "
             "auto_capture_gate=%s confirmation_result=not_used confirmation_blocking=0 "
-            "reason=%s confidence=%.3f bbox=%s corners=%s stable_count=%d/%d displacement_px=%.2f",
+            "reason=%s confidence=%.3f bbox=%s corners=%s stable_count=%d/%d "
+            "displacement_px=%.2f threshold_px=%.2f rotation_deg=%.1f border_contacts=%d",
             status,
             int(geom.present),
             int(stab.stable),
@@ -513,6 +520,44 @@ class ApplicationOrchestrator:
             stab.stable_count,
             stab.stable_frames_required,
             stab.displacement_px,
+            stab.effective_threshold_px or stab.threshold_px,
+            float(geom.rotation_deg),
+            int(geom.border_sides),
+        )
+
+    def _log_auto_capture_blocked(self, *, reason: str, geom: DocumentGeometryResult) -> None:
+        stab = self.geometry_stability.debug_info()
+        raw_present = geom.present and geom.reason != "geometry_held"
+        key = (
+            self.sm.state.value,
+            reason,
+            int(geom.present),
+            stab.stable_count,
+            round(stab.displacement_px, 0),
+            int(self._awaiting_clear_scene),
+        )
+        if key == self._last_block_key:
+            return
+        self._last_block_key = key
+        logger.info(
+            "event=auto_capture_blocked state=%s state_from=%s geometry_present=%s geometry_stable=%s "
+            "raw_quad_present=%s rotation_deg=%.1f border_contacts=%d stability_count=%d "
+            "stability_required=%d corner_displacement_px=%.2f stability_threshold=%.2f "
+            "failure_reason=%s awaiting_clear_scene=%s geometry_reason=%s",
+            self.sm.state.value,
+            self.sm.state.value,
+            int(geom.present),
+            int(stab.stable),
+            int(raw_present),
+            float(geom.rotation_deg),
+            int(geom.border_sides),
+            stab.stable_count,
+            stab.stable_frames_required,
+            stab.displacement_px,
+            stab.effective_threshold_px or stab.threshold_px,
+            reason,
+            int(self._awaiting_clear_scene),
+            geom.reason,
         )
 
     async def _check_motion_abort(self) -> bool:
@@ -614,6 +659,8 @@ class ApplicationOrchestrator:
             return
         if present:
             status = "geometry_held" if geom.reason == "geometry_held" else "geometry_unstable"
+            if status != self._last_geometry_status:
+                self._log_auto_capture_blocked(reason="stability_not_ready", geom=geom)
             self._log_geometry_status(status, geom)
             return
         self._idle_reject_count += 1
@@ -778,8 +825,13 @@ class ApplicationOrchestrator:
             self.sm.touch_progress()
             return
         self._stability_absent_count = 0
-        displacement_ok = self.geometry_stability.last_displacement_px <= self.geometry_stability.threshold_px
-        if geom.present and displacement_ok and (ready or self._stability_latched):
+        same_doc = self.geometry_stability.last_same_document
+        if self._stability_latched and not same_doc:
+            self._log_auto_capture_blocked(reason="document_moved", geom=geom)
+            self._log_geometry_status("geometry_unstable", geom)
+            self.sm.touch_progress()
+            return
+        if geom.present and (ready or self._stability_latched):
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
                 "event=auto_capture_gate geometry_present=1 geometry_stable=1 auto_capture_gate=1 "
@@ -808,6 +860,8 @@ class ApplicationOrchestrator:
             self._set_manual_phase("focusing", "Focusing...")
             self._transition(AppState.FOCUSING, reason="document_stable")
             return
+        reason = "stability_not_ready"
+        self._log_auto_capture_blocked(reason=reason, geom=geom)
         status = "geometry_held" if geom.reason == "geometry_held" else "geometry_unstable"
         self._log_geometry_status(status, geom)
         self.sm.touch_progress()
