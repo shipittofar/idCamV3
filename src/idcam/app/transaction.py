@@ -55,6 +55,9 @@ class ActiveCaptureTransaction:
     focus_verify_attempts: int = 0
     trigger: str = "auto"
     applied_async_ops: set[str] = field(default_factory=set)
+    document_confirmed: bool = False
+    confirmed_geometry_mode: str = ""
+    confirmed_roi: tuple[int, int, int, int] | None = None
 
     def try_consume_async(self, operation: str) -> bool:
         """Return True once per operation name; later completions are stale."""
@@ -130,6 +133,9 @@ class ActiveCaptureTransaction:
             "image_sha256": self.image_sha256,
             "failure_reason": self.failure_reason,
             "trigger": self.trigger,
+            "document_confirmed": self.document_confirmed,
+            "confirmed_geometry_mode": self.confirmed_geometry_mode,
+            "confirmed_roi": self.confirmed_roi,
         }
 
     @property

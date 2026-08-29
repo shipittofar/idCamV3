@@ -164,6 +164,7 @@ class TestDocumentLifecycle:
         orch._transaction.mark_focus_completed(90.0, 10.0)
         page = _document_frame()
         orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
         orch._check_motion_abort = AsyncMock(return_value=True)
 
         async def fake_capture(_camera, path):
@@ -238,6 +239,7 @@ class TestFailures:
         orch._transaction.mark_focus_completed(90.0, 10.0)
         page = _document_frame()
         orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
         orch._check_motion_abort = AsyncMock(return_value=True)
         orch.capture_service.capture = AsyncMock(side_effect=CaptureError("encoder failed"))
         orch.camera.restart = MagicMock()
@@ -576,6 +578,7 @@ class TestStaleAsyncOps:
         orch._transaction.mark_focus_completed(90.0, 10.0)
         page = _document_frame()
         orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
         orch._check_motion_abort = AsyncMock(return_value=True)
 
         async def fake_capture(_camera, path):

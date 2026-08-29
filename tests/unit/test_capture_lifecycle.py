@@ -161,6 +161,7 @@ class TestAutoCapturePath:
         orch._transaction.mark_focus_completed(90.0, 10.0)
         page = _document_frame()
         orch._snapshot_accepted_geometry(orch.detector.detect_geometry(page))
+        orch._safe_preview = AsyncMock(return_value=page)
         orch._check_motion_abort = AsyncMock(return_value=True)
 
         async def fake_capture(_camera, path):

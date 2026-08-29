@@ -633,6 +633,9 @@ def _build_large_document_candidate(
     if _is_full_frame_quad(corners, src_width, src_height, px=6.0) or n_sides >= 4:
         _emit(False, "frame_aligned")
         return None
+    if n_sides >= 3 and fold < LARGE_MIN_FOLD and quad_area_ratio >= 0.45:
+        _emit(False, "frame_aligned")
+        return None
     if quad_area_ratio > LARGE_MAX_AREA and n_sides >= 3:
         _emit(False, "frame_aligned")
         return None
@@ -997,7 +1000,16 @@ def _rank_key(cand: QuadCandidate) -> tuple[float, float]:
         booklet = 0.02
     # Prefer a true page inset from the frame over a quad that swallowed the margin.
     flush = 0.06 if cand.border_distance < 2.5 else 0.0
-    return (cand.confidence + booklet - flush, cand.border_distance)
+    # Do not let a weak full-span large-document hypothesis beat an inset page.
+    swallowed = 0.0
+    if (
+        cand.geometry_mode == "large_document_outer"
+        and cand.area_ratio >= 0.50
+        and cand.border_distance < 4.0
+        and cand.edge_support < 0.55
+    ):
+        swallowed = 0.12
+    return (cand.confidence + booklet - flush - swallowed, cand.border_distance)
 
 
 def find_document_quad(frame: np.ndarray, *, trace: object | None = None) -> tuple[QuadCandidate | None, int]:

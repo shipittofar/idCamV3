@@ -39,6 +39,15 @@ class DebugSnapshot:
     timestamp: float = 0.0
     state: str = "BOOT"
     document_detected: bool = False
+    geometry_candidate: bool = False
+    document_confirmed: bool = False
+    confirmation_reason: str = ""
+    evidence_edge_support: float = 0.0
+    evidence_edge_sides: int = 0
+    evidence_paper_contrast: float = 0.0
+    evidence_print: float = 0.0
+    evidence_line_structure: float = 0.0
+    evidence_fold: float = 0.0
     motion: float = 0.0
     edge_density: float = 0.0
     motion_threshold: float = 8.0
@@ -216,11 +225,12 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
     h, w = debug_frame.shape[:2]
     rh, rw = int(h * frac), int(w * frac)
     y0, x0 = (h - rh) // 2, (w - rw) // 2
-    cv2.rectangle(debug_frame, (x0, y0), (x0 + rw, y0 + rh), (0, 220, 80), 2)
+    cv2.rectangle(debug_frame, (x0, y0), (x0 + rw, y0 + rh), (70, 70, 70), 1)
     doc_roi = _parse_roi(snapshot.document_roi or snapshot.preview_focus_roi or snapshot.focus_roi)
     if doc_roi is not None:
         dx, dy, dw, dh = doc_roi
-        cv2.rectangle(debug_frame, (dx, dy), (dx + dw, dy + dh), (80, 180, 255), 2)
+        color = (40, 220, 90) if snapshot.document_confirmed else (40, 200, 255)
+        cv2.rectangle(debug_frame, (dx, dy), (dx + dw, dy + dh), color, 2)
     focus_live = _parse_roi(snapshot.focus_roi_live)
     if focus_live is not None:
         fx, fy, fw, fh = focus_live
@@ -229,7 +239,7 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
     camera = "OK" if snapshot.camera_healthy else "ERROR"
     if not snapshot.camera_healthy and snapshot.waiting_for_camera and not snapshot.camera_error:
         camera = "WAITING"
-    document = "YES" if snapshot.document_detected else "NO"
+    document = "CONFIRMED" if snapshot.document_confirmed else ("CANDIDATE" if snapshot.geometry_candidate or snapshot.document_detected else "NO")
     banner = None
     if snapshot.waiting_for_camera and not snapshot.camera_error:
         banner = "WAITING FOR CAMERA..."
@@ -238,7 +248,12 @@ def draw_overlay(frame: np.ndarray, snapshot: DebugSnapshot, fps: float) -> np.n
 
     lines = [
         f"STATE: {snapshot.state}",
+        f"GEOMETRY: {'candidate' if (snapshot.geometry_candidate or snapshot.document_detected) else 'none'}",
         f"DOCUMENT: {document}",
+        f"CONFIRM: {snapshot.confirmation_reason or '-'}",
+        f"EDGE SIDES: {snapshot.evidence_edge_sides} support={snapshot.evidence_edge_support:.2f}",
+        f"PAPER CONTRAST: {snapshot.evidence_paper_contrast:.2f}",
+        f"PRINT/LINE/FOLD: {snapshot.evidence_print:.2f}/{snapshot.evidence_line_structure:.2f}/{snapshot.evidence_fold:.2f}",
         f"MOTION: {snapshot.motion:.2f}",
         f"MOTION THRESHOLD: {snapshot.motion_threshold:.2f}",
         f"EDGE: {snapshot.edge_density:.4f}",
@@ -381,6 +396,12 @@ _HTML_PAGE = """<!DOCTYPE html>
         <dt>State</dt><dd id="state">—</dd>
         <dt>Camera</dt><dd id="camera">—</dd>
         <dt>Detection</dt><dd id="detection">—</dd>
+        <dt>Geometry</dt><dd id="geometry">—</dd>
+        <dt>Document confirmed</dt><dd id="confirmed">—</dd>
+        <dt>Confirmation</dt><dd id="confirmreason">—</dd>
+        <dt>Edge support</dt><dd id="edgesupport">—</dd>
+        <dt>Paper contrast</dt><dd id="papercontrast">—</dd>
+        <dt>Print / fold</dt><dd id="printfold">—</dd>
         <dt>Reject reason</dt><dd id="reject">—</dd>
         <dt>Motion</dt><dd id="motion">—</dd>
         <dt>Frame motion</dt><dd id="framemotion">—</dd>
@@ -474,7 +495,15 @@ _HTML_PAGE = """<!DOCTYPE html>
         const d = await r.json();
         el("state").textContent = d.state || "—";
         el("camera").textContent = d.camera_healthy ? "healthy" : "unhealthy";
-        el("detection").textContent = d.document_detected ? "detected" : "not detected";
+        el("detection").textContent = d.document_confirmed
+          ? "confirmed"
+          : (d.geometry_candidate || d.document_detected ? "candidate" : "none");
+        if (el("geometry")) el("geometry").textContent = (d.geometry_candidate || d.document_detected) ? "candidate" : "none";
+        if (el("confirmed")) el("confirmed").textContent = d.document_confirmed ? "yes" : "no";
+        if (el("confirmreason")) el("confirmreason").textContent = d.confirmation_reason || "—";
+        if (el("edgesupport")) el("edgesupport").textContent = (d.evidence_edge_sides ?? 0) + " sides / " + Number(d.evidence_edge_support || 0).toFixed(2);
+        if (el("papercontrast")) el("papercontrast").textContent = Number(d.evidence_paper_contrast || 0).toFixed(2);
+        if (el("printfold")) el("printfold").textContent = Number(d.evidence_print || 0).toFixed(2) + " / " + Number(d.evidence_fold || 0).toFixed(2);
         el("reject").textContent = d.reject_reason || "—";
         el("motion").textContent = Number(d.motion).toFixed(2);
         el("framemotion").textContent = Number(d.frame_motion || 0).toFixed(2);
@@ -927,6 +956,15 @@ class LiveDebugViewer:
         *,
         state: str,
         document_detected: bool,
+        geometry_candidate: bool = False,
+        document_confirmed: bool = False,
+        confirmation_reason: str = "",
+        evidence_edge_support: float = 0.0,
+        evidence_edge_sides: int = 0,
+        evidence_paper_contrast: float = 0.0,
+        evidence_print: float = 0.0,
+        evidence_line_structure: float = 0.0,
+        evidence_fold: float = 0.0,
         motion: float,
         edge_density: float,
         motion_threshold: float,
@@ -991,6 +1029,15 @@ class LiveDebugViewer:
                 timestamp=time.time(),
                 state=state,
                 document_detected=document_detected,
+                geometry_candidate=geometry_candidate,
+                document_confirmed=document_confirmed,
+                confirmation_reason=confirmation_reason,
+                evidence_edge_support=evidence_edge_support,
+                evidence_edge_sides=evidence_edge_sides,
+                evidence_paper_contrast=evidence_paper_contrast,
+                evidence_print=evidence_print,
+                evidence_line_structure=evidence_line_structure,
+                evidence_fold=evidence_fold,
                 motion=motion,
                 edge_density=edge_density,
                 motion_threshold=motion_threshold,
@@ -1069,6 +1116,15 @@ class LiveDebugViewer:
             "enabled": True,
             "state": snap.state,
             "document_detected": snap.document_detected,
+            "geometry_candidate": snap.geometry_candidate,
+            "document_confirmed": snap.document_confirmed,
+            "confirmation_reason": snap.confirmation_reason,
+            "evidence_edge_support": round(snap.evidence_edge_support, 3),
+            "evidence_edge_sides": snap.evidence_edge_sides,
+            "evidence_paper_contrast": round(snap.evidence_paper_contrast, 3),
+            "evidence_print": round(snap.evidence_print, 3),
+            "evidence_line_structure": round(snap.evidence_line_structure, 3),
+            "evidence_fold": round(snap.evidence_fold, 3),
             "motion": snap.motion,
             "edge_density": snap.edge_density,
             "motion_threshold": snap.motion_threshold,
