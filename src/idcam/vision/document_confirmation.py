@@ -155,8 +155,8 @@ def _side_edge_scores(mag: np.ndarray, corners: np.ndarray) -> tuple[list[float]
             continue
         inward = np.array([-edge[1], edge[0]], dtype=np.float32) / length
         outward = -inward
-        near = min(10.0, max(4.0, 0.025 * max(h, w)))
-        far = min(22.0, max(10.0, 0.05 * max(h, w)))
+        near = float(np.clip(0.04 * length, 3.0, 16.0))
+        far = float(np.clip(0.09 * length, 8.0, 32.0))
         ts = np.linspace(0.12, 0.88, samples, dtype=np.float32)
         on_pts = a[None, :] + ts[:, None] * edge[None, :]
         peak = 0.0
@@ -189,8 +189,10 @@ def _side_edge_scores(mag: np.ndarray, corners: np.ndarray) -> tuple[list[float]
 
 def _quad_region_stats(gray: np.ndarray, corners: np.ndarray) -> tuple[float, float, np.ndarray]:
     pts = order_corners(corners)
-    us = np.linspace(_INTERIOR_INSET, 1.0 - _INTERIOR_INSET, 12)
-    vs = np.linspace(_INTERIOR_INSET, 1.0 - _INTERIOR_INSET, 12)
+    mean_side = 0.25 * sum(float(np.linalg.norm(pts[(i + 1) % 4] - pts[i])) for i in range(4))
+    inset = float(np.clip(6.0 / max(mean_side, 1.0), 0.10, 0.22))
+    us = np.linspace(inset, 1.0 - inset, 12)
+    vs = np.linspace(inset, 1.0 - inset, 12)
     grid = []
     for v in vs:
         top = (1.0 - v) * pts[0] + v * pts[3]
@@ -208,7 +210,6 @@ def _quad_region_stats(gray: np.ndarray, corners: np.ndarray) -> tuple[float, fl
 def _surround_stats(gray: np.ndarray, corners: np.ndarray) -> tuple[float, float]:
     h, w = gray.shape[:2]
     pts = order_corners(corners)
-    offset = min(22.0, max(8.0, 0.05 * max(h, w)))
     collected: list[np.ndarray] = []
     for i in range(4):
         a, b = pts[i], pts[(i + 1) % 4]
@@ -216,8 +217,8 @@ def _surround_stats(gray: np.ndarray, corners: np.ndarray) -> tuple[float, float
         length = float(np.linalg.norm(edge))
         if length < 8.0:
             continue
-        inward = np.array([-edge[1], edge[0]], dtype=np.float32) / length
-        outward = -inward
+        outward = np.array([edge[1], -edge[0]], dtype=np.float32) / length
+        offset = float(np.clip(0.08 * length, 6.0, 28.0))
         ts = np.linspace(0.12, 0.88, 14, dtype=np.float32)
         on_pts = a[None, :] + ts[:, None] * edge[None, :]
         for mul in (1.0, 1.6):
@@ -396,7 +397,7 @@ class DocumentConfirmationTracker:
             "evidence_interior_std=%.1f evidence_surround_std=%.1f evidence_print=%.3f "
             "evidence_line_structure=%.3f evidence_fold=%.3f roi_x=%d roi_y=%d "
             "roi_width=%d roi_height=%d geometry_mode=%s geometry_aspect=%.3f "
-            "geometry_area_fraction=%.3f",
+            "geometry_area_fraction=%.3f geometry_rotation_deg=%.1f geometry_border_sides=%d",
             status,
             result.reason,
             int(result.accepted),
@@ -420,4 +421,6 @@ class DocumentConfirmationTracker:
             result.geometry_mode,
             result.geometry_aspect,
             result.geometry_area_fraction,
+            float(getattr(geom, "rotation_deg", 0.0) or 0.0),
+            int(getattr(geom, "border_sides", 0) or 0),
         )

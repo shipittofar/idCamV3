@@ -40,7 +40,8 @@ from idcam import __version__  # noqa: E402
 from idcam.camera.manager import PICAMERA2_AVAILABLE, CameraManager  # noqa: E402
 from idcam.config.schema import CameraConfig, DetectionConfig  # noqa: E402
 from idcam.vision.document_detector import DocumentDetector  # noqa: E402
-from idcam.vision.geometry import find_document_quad  # noqa: E402
+from idcam.vision.document_confirmation import confirm_document  # noqa: E402
+from idcam.vision.geometry import _quad_edge_lengths, find_document_quad  # noqa: E402
 from idcam.vision.geometry_debug import (  # noqa: E402
     classify_failure,
     diagnose_frame,
@@ -142,11 +143,28 @@ def main() -> int:
     trace = diagnose_frame(frame)
     detector = DocumentDetector(DetectionConfig())
     geom = detector.detect_geometry(frame)
+    confirmation = confirm_document(frame, geom)
     case = classify_failure(trace, detector_present=geom.present)
     save_rgb_jpeg(overlay_path, render_overlay(frame, trace))
 
     print("=== FRAME ===")
     print(json.dumps({"source": source, "shape": list(frame.shape), "saved": str(raw_path), "overlay": str(overlay_path)}, indent=2))
+    print("=== DOCUMENT_GEOMETRY ===")
+    print(
+        json.dumps(
+            {
+                "mode": None if best is None else best.geometry_mode,
+                "occupancy": None if best is None else best.area_ratio,
+                "oriented_aspect": None if best is None else best.quad_aspect,
+                "rotation_deg": None if best is None else best.rotation_angle,
+                "border_contacts": None if best is None else best.border_sides,
+                "quad": None if best is None else best.corners.tolist(),
+                "side_lengths": None if best is None else [float(x) for x in _quad_edge_lengths(best.corners)],
+                "edge_support": None if best is None else best.edge_support,
+            },
+            indent=2,
+        )
+    )
     print("=== FINDER ===")
     print(
         json.dumps(
@@ -168,6 +186,22 @@ def main() -> int:
                 "rotation_angle": None if best is None else best.rotation_angle,
                 "recovered_corner_source": None if best is None else best.recovered_corner_source,
                 "large_document_candidate": False if best is None else best.geometry_mode == "large_document_outer",
+            },
+            indent=2,
+        )
+    )
+    print("=== DOCUMENT_CONFIRMATION ===")
+    print(
+        json.dumps(
+            {
+                "result": "accepted" if confirmation.accepted else "rejected",
+                "reason": confirmation.reason,
+                "edge_support": confirmation.evidence_edge_support,
+                "edge_sides": confirmation.evidence_edge_sides,
+                "interior_surround": confirmation.evidence_paper_contrast,
+                "fold": confirmation.evidence_fold,
+                "print": confirmation.evidence_print,
+                "geometry_mode": confirmation.geometry_mode,
             },
             indent=2,
         )

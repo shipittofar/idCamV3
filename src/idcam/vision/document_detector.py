@@ -65,6 +65,10 @@ class DocumentGeometryResult:
     aspect_ratio: float = 0.0
     rectangularity: float = 0.0
     geometry_mode: str = "none"
+    rotation_deg: float = 0.0
+    border_sides: int = 0
+    quad_aspect: float = 0.0
+    edge_support: float = 0.0
 
     def corners_array(self) -> np.ndarray | None:
         if self.corners is None:
@@ -198,6 +202,10 @@ class DocumentDetector:
                 aspect_ratio=float(raw.aspect_ratio),
                 rectangularity=float(raw.rectangularity),
                 geometry_mode=str(raw.geometry_mode),
+                rotation_deg=float(raw.rotation_angle),
+                border_sides=int(raw.border_sides),
+                quad_aspect=float(raw.quad_aspect),
+                edge_support=float(raw.edge_support),
             )
             self._last_geometry = result
             if not was_present:
@@ -205,6 +213,7 @@ class DocumentDetector:
                     "event=document_geometry present=1 confidence=%.3f reason=quad "
                     "geometry_mode=%s candidates=%d document_area_ratio=%.3f "
                     "document_aspect_ratio=%.3f document_rectangularity=%.3f "
+                    "document_rotation_deg=%.1f document_border_sides=%d "
                     "document_bbox=%d,%d,%d,%d document_quad=%s",
                     result.confidence,
                     result.geometry_mode,
@@ -212,6 +221,8 @@ class DocumentDetector:
                     result.selected_area_ratio,
                     result.aspect_ratio,
                     result.rectangularity,
+                    result.rotation_deg,
+                    result.border_sides,
                     *bbox,
                     result.corners,
                 )
@@ -234,6 +245,10 @@ class DocumentDetector:
                 aspect_ratio=self._last_geometry.aspect_ratio,
                 rectangularity=self._last_geometry.rectangularity,
                 geometry_mode=self._last_geometry.geometry_mode,
+                rotation_deg=self._last_geometry.rotation_deg,
+                border_sides=self._last_geometry.border_sides,
+                quad_aspect=self._last_geometry.quad_aspect,
+                edge_support=self._last_geometry.edge_support,
             )
             self._last_geometry = result
             maybe_persist_from_detector(frame, result, self)

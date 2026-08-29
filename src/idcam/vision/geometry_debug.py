@@ -54,6 +54,7 @@ def effective_geometry_config() -> dict[str, Any]:
         "LARGE_MAX_AREA": geom.LARGE_MAX_AREA,
         "LARGE_MIN_QUAD_ASPECT": geom.LARGE_MIN_QUAD_ASPECT,
         "LARGE_MAX_QUAD_ASPECT": geom.LARGE_MAX_QUAD_ASPECT,
+        "SMALL_EVIDENCE_MIN_AREA": geom.SMALL_EVIDENCE_MIN_AREA,
         "geometry_module": getattr(geom, "__file__", None),
         "has_merged_two_page": hasattr(geom, "_try_merge_two_page"),
         "has_suppress_inner": hasattr(geom, "_suppress_inner_quads"),
@@ -103,7 +104,8 @@ def classify_failure(trace: GeometryTrace, *, detector_present: bool | None = No
     page_like = [
         c
         for c in accepted
-        if 0.55 <= float(c.get("aspect_ratio") or 0) <= 1.85 and float(c.get("area_ratio") or 0) >= 0.08
+        if 1.02 <= float(c.get("quad_aspect") or c.get("aspect_ratio") or 0) <= 1.85
+        and float(c.get("area_ratio") or 0) >= 0.08
     ]
     wide_rejected = [
         c
@@ -188,7 +190,7 @@ def render_overlay(frame: np.ndarray, trace: GeometryTrace) -> np.ndarray:
         x, y, w, h = [int(v) for v in trace.final["bbox"]]
         cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 255, 255), 3)
         mode = trace.final.get("geometry_mode")
-        _put(vis, f"FINAL geometry_mode={mode}", 12, 28, (255, 255, 255))
+        _put(vis, f"FINAL geometry_mode={mode} aspect={trace.final.get('oriented_aspect') or trace.final.get('quad_aspect')} rot={trace.final.get('rotation_angle')}", 12, 28, (255, 255, 255))
         corners = trace.final.get("quad")
         if corners is not None:
             pts = np.asarray(corners, dtype=np.int32).reshape(-1, 1, 2)
@@ -270,6 +272,9 @@ def diagnose_frame(frame: np.ndarray) -> GeometryTrace:
             "rotation_angle": best.rotation_angle,
             "recovered_corner_source": best.recovered_corner_source,
             "large_document_candidate": best.geometry_mode == "large_document_outer",
+            "oriented_aspect": best.quad_aspect,
+            "occupancy": best.area_ratio,
+            "border_contacts": best.border_sides,
         }
     return trace
 
