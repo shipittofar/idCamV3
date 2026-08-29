@@ -63,6 +63,7 @@ class DocumentGeometryResult:
     selected_area_ratio: float = 0.0
     aspect_ratio: float = 0.0
     rectangularity: float = 0.0
+    geometry_mode: str = "none"
 
     def corners_array(self) -> np.ndarray | None:
         if self.corners is None:
@@ -195,19 +196,23 @@ class DocumentDetector:
                 selected_area_ratio=float(raw.area_ratio),
                 aspect_ratio=float(raw.aspect_ratio),
                 rectangularity=float(raw.rectangularity),
+                geometry_mode=str(raw.geometry_mode),
             )
             self._last_geometry = result
             if not was_present:
                 logger.info(
                     "event=document_geometry present=1 confidence=%.3f reason=quad "
-                    "candidates=%d area_ratio=%.3f aspect=%.3f rectangularity=%.3f "
-                    "bbox=%d,%d,%d,%d",
+                    "geometry_mode=%s candidates=%d document_area_ratio=%.3f "
+                    "document_aspect_ratio=%.3f document_rectangularity=%.3f "
+                    "document_bbox=%d,%d,%d,%d document_quad=%s",
                     result.confidence,
+                    result.geometry_mode,
                     candidate_count,
                     result.selected_area_ratio,
                     result.aspect_ratio,
                     result.rectangularity,
                     *bbox,
+                    result.corners,
                 )
             return result
 
@@ -226,6 +231,7 @@ class DocumentDetector:
                 selected_area_ratio=self._last_geometry.selected_area_ratio,
                 aspect_ratio=self._last_geometry.aspect_ratio,
                 rectangularity=self._last_geometry.rectangularity,
+                geometry_mode=self._last_geometry.geometry_mode,
             )
             self._last_geometry = result
             return result
