@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 
 import cv2
@@ -9,8 +10,13 @@ import numpy as np
 import pytest
 
 from idcam.config.schema import DetectionConfig
-from idcam.vision.document_confirmation import CONFIRM_WORKING_WIDTH, confirm_document
-from idcam.vision.document_detector import DocumentDetector
+from idcam.vision.document_confirmation import (
+    CONFIRM_WORKING_WIDTH,
+    _MIN_SIDE_ON,
+    _MIN_SIDES_NORMAL,
+    confirm_document,
+)
+from idcam.vision.document_detector import DocumentDetector, DocumentGeometryResult
 from idcam.vision.geometry import WORKING_WIDTH
 from idcam.vision.geometry_debug import effective_resolution_chain
 
@@ -159,3 +165,103 @@ class TestLatencySanity:
         assert geom.present and conf.accepted
         assert (t1 - t0) < 2.5
         assert (t2 - t1) < 0.75
+
+
+class TestBorderAwareConfirmation:
+    def test_normal_side_thresholds_unchanged(self):
+        assert _MIN_SIDES_NORMAL == 3
+        assert _MIN_SIDE_ON == 14.0
+
+    def test_confirmation_has_no_center_roi_gate(self):
+        from idcam.vision import document_confirmation as mod
+
+        src = inspect.getsource(mod)
+        assert "roi_center_fraction" not in src
+        assert "center_70" not in src
+        assert "center70" not in src
+
+    def _three_border_sheet(self) -> np.ndarray:
+        from tests.unit.test_large_two_page_geometry import _wood_table
+
+        h, w = 1080, 1920
+        img = _wood_table((h, w))
+        x0 = 340
+        img[:, x0:] = (242, 238, 230)
+        img[:, x0 : x0 + 5] = 32
+        for row in range(50, h - 50, 16):
+            img[row : row + 2, x0 + 24 : w - 24] = (28, 28, 34)
+        return img
+
+    def test_pi_like_three_border_quad_confirms(self):
+        frame = self._three_border_sheet()
+        geom = DocumentGeometryResult(
+            present=True,
+            confidence=0.9239,
+            corners=((342.0, 159.0), (1918.5, 0.0), (1918.5, 1078.5), (379.5, 1078.5)),
+            bbox=(342, 0, 1577, 1080),
+            reason="quad",
+            selected_area_ratio=0.761,
+            aspect_ratio=1.563,
+            rectangularity=0.55,
+            geometry_mode="paper_region",
+            rotation_deg=-5.759,
+            border_sides=3,
+            quad_aspect=1.563,
+            edge_support=0.607,
+        )
+        conf = confirm_document(frame, geom)
+        assert conf.accepted is True
+        assert conf.occluded_side_count >= 2
+        assert conf.observed_side_count >= 1
+        assert conf.evidence_edge_sides >= 1
+        assert sum(conf.side_border_occluded) >= 2
+
+    def test_one_and_two_border_pages_confirm(self, detection_config):
+        one = _dc(_id_card(box=(0, 80, 400, 280), printed=True), detection_config)
+        two = _dc(_id_card(box=(0, 0, 420, 300), printed=True), detection_config)
+        assert one[1].accepted and two[1].accepted
+
+    def test_clipped_open_passport(self, detection_config):
+        frame = _opened_passport((1080, 1920), (80, 0, 1400, 1080))
+        geom, conf = _dc(frame, detection_config)
+        assert geom.present is True
+        assert conf.accepted is True
+
+    def test_weak_three_border_without_document_edge_rejected(self):
+        h, w = 480, 640
+        img = np.full((h, w, 3), 90, dtype=np.uint8)
+        img[:, 80:] = 110
+        geom = DocumentGeometryResult(
+            present=True,
+            confidence=0.40,
+            corners=((80.0, 0.0), (639.0, 0.0), (639.0, 479.0), (80.0, 479.0)),
+            bbox=(80, 0, 560, 480),
+            reason="quad",
+            selected_area_ratio=0.75,
+            aspect_ratio=1.4,
+            rectangularity=0.4,
+            geometry_mode="paper_region",
+            border_sides=3,
+            quad_aspect=1.4,
+            edge_support=0.10,
+        )
+        conf = confirm_document(img, geom)
+        assert conf.accepted is False
+
+    def test_occupancy_alone_is_not_enough(self):
+        img = np.full((480, 640, 3), 200, dtype=np.uint8)
+        geom = DocumentGeometryResult(
+            present=True,
+            confidence=0.95,
+            corners=((0.0, 0.0), (639.0, 0.0), (639.0, 479.0), (0.0, 479.0)),
+            bbox=(0, 0, 640, 480),
+            reason="quad",
+            selected_area_ratio=0.99,
+            geometry_mode="paper_region",
+            border_sides=4,
+            edge_support=0.9,
+        )
+        conf = confirm_document(img, geom)
+        assert conf.accepted is False
+        assert conf.reason == "full_frame"
+

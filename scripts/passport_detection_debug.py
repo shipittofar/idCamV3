@@ -197,28 +197,42 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "result": "accepted" if confirmation.accepted else "rejected",
-                "reason": confirmation.reason,
+                "confirmation_candidate": confirmation.candidate_present,
+                "confirmation_result": "accepted" if confirmation.accepted else "rejected",
+                "confirmation_rejection_reason": confirmation.reason,
                 "working_resolution": f"{confirmation.working_width}x{confirmation.working_height}",
-                "edge_support": {
-                    "top": confirmation.edge_support_top,
-                    "right": confirmation.edge_support_right,
-                    "bottom": confirmation.edge_support_bottom,
-                    "left": confirmation.edge_support_left,
-                    "mean": confirmation.edge_support_mean,
-                    "min": confirmation.edge_support_min,
-                    "supported_sides": confirmation.evidence_edge_sides,
-                    "band_width_px": confirmation.edge_band_width_px,
-                    "inner_offset_px": confirmation.edge_band_inner_offset_px,
-                    "outer_offset_px": confirmation.edge_band_outer_offset_px,
-                },
+                "sides": [
+                    {
+                        "side_name": name,
+                        "edge_score": score,
+                        "observable_fraction": frac,
+                        "valid_sample_count": n,
+                        "border_occluded": bool(occ),
+                    }
+                    for name, score, frac, n, occ in zip(
+                        ("top", "right", "bottom", "left"),
+                        (
+                            confirmation.edge_support_top,
+                            confirmation.edge_support_right,
+                            confirmation.edge_support_bottom,
+                            confirmation.edge_support_left,
+                        ),
+                        confirmation.side_observable_frac,
+                        confirmation.side_valid_samples,
+                        confirmation.side_border_occluded,
+                    )
+                ],
+                "observed_side_count": confirmation.observed_side_count,
+                "occluded_side_count": confirmation.occluded_side_count,
+                "edge_support_observable_mean": confirmation.edge_support_observable_mean,
                 "interior_surround": confirmation.evidence_paper_contrast,
                 "fold": confirmation.evidence_fold,
                 "print": confirmation.evidence_print,
-                "geometry_mode": confirmation.geometry_mode,
+                "geometry_confidence": confirmation.geometry_confidence,
+                "geometry_edge_support": confirmation.geometry_edge_support,
                 "occupancy": confirmation.geometry_area_fraction,
-                "rotation_deg": geom.rotation_deg,
                 "border_contacts": geom.border_sides,
+                "geometry_mode": confirmation.geometry_mode,
             },
             indent=2,
         )

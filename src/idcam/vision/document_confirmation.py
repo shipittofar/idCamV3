@@ -36,6 +36,16 @@ _MIN_PAPER_DELTA_BOOKLET = 12.0
 _MIN_PAPER_NORM = 0.18
 _FULL_FRAME_AREA = 0.94
 _INTERIOR_INSET = 0.18
+_BORDER_PX = 8.0
+_BORDER_CONTACT_FRAC = 0.40
+_OUTWARD_INFRAME_MIN = 0.30
+_ON_SIDE_INFRAME_MIN = 0.35
+_LARGE_BORDER_MIN_OCC = 0.28
+_LARGE_BORDER_MAX_OCC = 0.92
+_LARGE_BORDER_MIN_CONF = 0.70
+_LARGE_BORDER_MIN_GEOM_EDGE = 0.32
+_LARGE_BORDER_MIN_PAPER_NORM = 0.30
+_SIDE_NAMES = ("top", "right", "bottom", "left")
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,14 @@ class DocumentConfirmation:
     edge_band_width_px: float = 0.0
     edge_band_inner_offset_px: float = 0.0
     edge_band_outer_offset_px: float = 0.0
+    observed_side_count: int = 0
+    occluded_side_count: int = 0
+    edge_support_observable_mean: float = 0.0
+    geometry_confidence: float = 0.0
+    geometry_edge_support: float = 0.0
+    side_observable_frac: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    side_valid_samples: tuple[int, int, int, int] = (0, 0, 0, 0)
+    side_border_occluded: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
 def _empty_confirmation(
@@ -163,6 +181,16 @@ def _sample_at(image: np.ndarray, points: np.ndarray) -> np.ndarray:
 
 
 @dataclass
+class SideEval:
+    name: str
+    score: float
+    observable_fraction: float
+    valid_sample_count: int
+    border_occluded: bool
+    status: str
+
+
+@dataclass
 class EdgeBandResult:
     scores: list[float]
     supported: int
@@ -171,89 +199,125 @@ class EdgeBandResult:
     inner_offset: float
     outer_offset: float
     side_lengths: list[float]
+    sides: list[SideEval]
+    observable_count: int
+    occluded_count: int
+    observable_mean: float
+
+
+def _in_frame_mask(points: np.ndarray, width: int, height: int) -> np.ndarray:
+    return (points[:, 0] >= 0) & (points[:, 0] < width) & (points[:, 1] >= 0) & (points[:, 1] < height)
+
+
+def _border_contact_fraction(a: np.ndarray, b: np.ndarray, width: int, height: int, *, px: float, samples: int = 20) -> float:
+    ts = np.linspace(0.05, 0.95, samples, dtype=np.float32)
+    pts = a[None, :] + ts[:, None] * (b - a)[None, :]
+    dist = np.minimum.reduce(
+        [pts[:, 0], pts[:, 1], (width - 1) - pts[:, 0], (height - 1) - pts[:, 1]]
+    )
+    return float(np.mean(dist <= px))
 
 
 def _side_edge_scores(mag: np.ndarray, corners: np.ndarray) -> EdgeBandResult:
     """Per-side localized *boundary* support (not generic texture energy).
 
-    For each ordered side: tangent along the edge, inward/outward normals.
-    Peak Sobel in a size-adaptive normal band vs farther interior and exterior.
-    Missing exterior samples (frame border) are omitted, not treated as zero energy.
-    Corner thirds are skipped (t in 0.15–0.85).
+    Border-occluded sides are unevaluable (not score 0). Scores and means use
+    observable sides only.
     """
+    h_m, w_m = mag.shape[:2]
     pts = order_corners(corners)
-    side_scores: list[float] = []
+    evals: list[SideEval] = []
     lengths: list[float] = []
-    supported = 0
-    samples = 20
     near_acc: list[float] = []
     far_acc: list[float] = []
+    samples = 20
     for i in range(4):
+        name = _SIDE_NAMES[i]
         a, b = pts[i], pts[(i + 1) % 4]
         edge = b - a
         length = float(np.linalg.norm(edge))
         lengths.append(length)
         if length < 8.0:
-            side_scores.append(0.0)
+            evals.append(SideEval(name, 0.0, 0.0, 0, True, "border_occluded"))
             continue
         inward = np.array([-edge[1], edge[0]], dtype=np.float32) / length
         outward = -inward
-        near = float(np.clip(0.03 * length, 4.0, 16.0))
-        h_m, w_m = mag.shape[:2]
+        near = float(np.clip(0.03 * length, 4.0, 20.0))
         far_cap = min(22.0, 0.08 * float(min(h_m, w_m)), 0.18 * length)
         far = float(np.clip(max(0.06 * length, 1.6 * near), 8.0, max(8.0, far_cap)))
         near_acc.append(near)
         far_acc.append(far)
         ts = np.linspace(0.15, 0.85, samples, dtype=np.float32)
         on_pts = a[None, :] + ts[:, None] * edge[None, :]
+        on_mask = _in_frame_mask(on_pts, w_m, h_m)
+        on_frac = float(np.mean(on_mask)) if on_mask.size else 0.0
+        out_pts = on_pts + outward[None, :] * far
+        out_frac = float(np.mean(_in_frame_mask(out_pts, w_m, h_m)))
+        contact = _border_contact_fraction(a, b, w_m, h_m, px=_BORDER_PX)
+        occluded = contact >= _BORDER_CONTACT_FRAC or on_frac < _ON_SIDE_INFRAME_MIN
+        if occluded:
+            evals.append(
+                SideEval(name, 0.0, on_frac, int(np.count_nonzero(on_mask)), True, "border_occluded")
+            )
+            continue
+        status = "fully_observable" if on_frac >= 0.85 and out_frac >= 0.6 else "partially_observable"
         peak = 0.0
+        peak_n = 0
         span = max(1, int(round(near)))
         for delta in range(-span, span + 1, 1):
             band = on_pts + outward[None, :] * float(delta)
-            med, _n = _median_valid(mag, band)
+            med, n = _median_valid(mag, band)
             if med is not None:
                 peak = max(peak, med)
-        out_v, n_out = _median_valid(mag, on_pts + outward[None, :] * far)
+                peak_n = max(peak_n, n)
+        if peak_n < _MIN_BAND_SAMPLES:
+            evals.append(SideEval(name, 0.0, on_frac, peak_n, True, "border_occluded"))
+            continue
+        out_v, n_out = _median_valid(mag, out_pts)
         in_v, n_in = _median_valid(mag, on_pts + inward[None, :] * far)
         out_ok = out_v is not None
         in_ok = in_v is not None
         score = 0.0
         ok = False
-        if peak < _MIN_SIDE_ON:
-            side_scores.append(0.0)
-            continue
-        if out_ok and in_ok:
-            d_out = peak - float(out_v)
-            d_in = peak - float(in_v)
-            ok = (d_out >= _MIN_SIDE_DELTA_OUT and d_in >= _MIN_SIDE_DELTA_IN) or (
-                d_in >= _MIN_SIDE_DELTA_OUT and d_out >= 0.0
-            )
-            if ok:
-                score = float(np.clip(0.5 * (max(d_out, 0.0) / 40.0) + 0.5 * (max(d_in, 0.0) / 40.0), 0.0, 1.0))
-        elif out_ok and not in_ok:
-            d_out = peak - float(out_v)
-            ok = d_out >= _MIN_SIDE_DELTA_OUT
-            if ok:
-                score = float(np.clip(d_out / 50.0, 0.0, 1.0))
-        elif in_ok and not out_ok:
-            d_in = peak - float(in_v)
-            ok = d_in >= _MIN_SIDE_DELTA_OUT
-            if ok:
-                score = float(np.clip(d_in / 50.0, 0.0, 1.0))
+        if peak >= _MIN_SIDE_ON:
+            if out_ok and in_ok:
+                d_out = peak - float(out_v)
+                d_in = peak - float(in_v)
+                ok = (d_out >= _MIN_SIDE_DELTA_OUT and d_in >= _MIN_SIDE_DELTA_IN) or (
+                    d_in >= _MIN_SIDE_DELTA_OUT and d_out >= 0.0
+                )
+                if ok:
+                    score = float(np.clip(0.5 * (max(d_out, 0.0) / 40.0) + 0.5 * (max(d_in, 0.0) / 40.0), 0.0, 1.0))
+            elif out_ok and not in_ok:
+                d_out = peak - float(out_v)
+                ok = d_out >= _MIN_SIDE_DELTA_OUT
+                if ok:
+                    score = float(np.clip(d_out / 50.0, 0.0, 1.0))
+            elif in_ok and not out_ok:
+                d_in = peak - float(in_v)
+                ok = d_in >= _MIN_SIDE_DELTA_OUT
+                if ok:
+                    score = float(np.clip(d_in / 50.0, 0.0, 1.0))
         if ok and score >= 0.08:
-            supported += 1
+            evals.append(SideEval(name, score, on_frac, peak_n, False, status))
         else:
-            score = 0.0
-        side_scores.append(score)
-    mean_score = float(np.mean(side_scores)) if side_scores else 0.0
+            evals.append(SideEval(name, 0.0, on_frac, peak_n, False, status))
+    scores = [s.score for s in evals]
+    observable = [s for s in evals if not s.border_occluded]
+    supported = sum(1 for s in observable if s.score >= 0.08)
+    obs_mean = float(np.mean([s.score for s in observable])) if observable else 0.0
     return EdgeBandResult(
-        scores=side_scores,
+        scores=scores,
         supported=supported,
-        mean=mean_score,
+        mean=obs_mean,
         band_width=float(np.mean(near_acc)) if near_acc else 0.0,
         inner_offset=float(np.mean(far_acc)) if far_acc else 0.0,
         outer_offset=float(np.mean(far_acc)) if far_acc else 0.0,
         side_lengths=lengths,
+        sides=evals,
+        observable_count=len(observable),
+        occluded_count=sum(1 for s in evals if s.border_occluded),
+        observable_mean=obs_mean,
     )
 
 
@@ -316,6 +380,26 @@ def _print_and_lines(gray: np.ndarray, mag: np.ndarray, interior_pts: np.ndarray
     return print_e, line_e
 
 
+def _max_corner_inset(corners: np.ndarray, width: int, height: int) -> float:
+    pts = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+    dist = np.minimum.reduce(
+        [pts[:, 0], pts[:, 1], (width - 1) - pts[:, 0], (height - 1) - pts[:, 1]]
+    )
+    return float(np.max(dist))
+
+
+def _side_tuple(sides: list[SideEval], attr: str) -> tuple[float, float, float, float]:
+    vals = [float(getattr(s, attr)) for s in sides[:4]]
+    vals.extend([0.0] * (4 - len(vals)))
+    return (vals[0], vals[1], vals[2], vals[3])
+
+
+def _side_int_tuple(sides: list[SideEval], attr: str) -> tuple[int, int, int, int]:
+    vals = [int(getattr(s, attr)) for s in sides[:4]]
+    vals.extend([0] * (4 - len(vals)))
+    return (vals[0], vals[1], vals[2], vals[3])
+
+
 def confirm_document(frame: np.ndarray, geom: DocumentGeometryResult) -> DocumentConfirmation:
     """Return whether ``geom`` is a document in ``frame`` (preview pixels)."""
     if not geom.present or geom.corners is None:
@@ -332,8 +416,10 @@ def confirm_document(frame: np.ndarray, geom: DocumentGeometryResult) -> Documen
     edge = _side_edge_scores(mag, work_pts)
     scores = (edge.scores + [0.0, 0.0, 0.0, 0.0])[:4]
     sides = edge.supported
-    edge_score = edge.mean
-    edge_support = float(sides) / 4.0
+    edge_score = edge.observable_mean
+    n_obs = edge.observable_count
+    n_occ = edge.occluded_count
+    edge_support = float(sides) / float(max(n_obs, 1)) if n_obs else 0.0
     interior_mean, interior_std, interior_pts = _quad_region_stats(work, work_pts)
     surround_mean, surround_std = _surround_stats(work, work_pts)
     paper_delta = abs(interior_mean - surround_mean)
@@ -350,12 +436,29 @@ def confirm_document(frame: np.ndarray, geom: DocumentGeometryResult) -> Documen
 
     if sides < min_sides:
         two_side_ok = (
-            sides >= 2
+            n_obs >= 2
+            and sides >= 2
             and paper_delta >= min_paper
             and edge_score >= _TWO_SIDE_MEAN_SCORE
         )
-        strong_paper = paper_delta >= 28.0 and sides >= 2
-        if two_side_ok or strong_paper:
+        strong_paper = paper_delta >= 28.0 and sides >= 2 and n_obs >= 2
+        inset = _max_corner_inset(corners, src_w, src_h)
+        large_border_ok = (
+            n_occ >= 2
+            and sides >= 1
+            and n_obs <= 2
+            and inset >= 16.0
+            and _LARGE_BORDER_MIN_OCC <= float(geom.selected_area_ratio) <= _LARGE_BORDER_MAX_OCC
+            and int(geom.border_sides) >= 2
+            and float(geom.confidence) >= _LARGE_BORDER_MIN_CONF
+            and (
+                float(geom.edge_support) >= _LARGE_BORDER_MIN_GEOM_EDGE
+                or geom.geometry_mode in {"paper_region", "large_document_outer", "merged_two_page"}
+            )
+            and paper_norm >= _LARGE_BORDER_MIN_PAPER_NORM
+            and paper_delta >= min_paper
+        )
+        if two_side_ok or strong_paper or large_border_ok:
             reason = "accepted"
             accepted = True
         else:
@@ -411,6 +514,14 @@ def confirm_document(frame: np.ndarray, geom: DocumentGeometryResult) -> Documen
         edge_band_width_px=float(edge.band_width),
         edge_band_inner_offset_px=float(edge.inner_offset),
         edge_band_outer_offset_px=float(edge.outer_offset),
+        observed_side_count=int(n_obs),
+        occluded_side_count=int(n_occ),
+        edge_support_observable_mean=float(edge.observable_mean),
+        geometry_confidence=float(geom.confidence),
+        geometry_edge_support=float(geom.edge_support),
+        side_observable_frac=_side_tuple(edge.sides, "observable_fraction"),
+        side_valid_samples=_side_int_tuple(edge.sides, "valid_sample_count"),
+        side_border_occluded=_side_int_tuple(edge.sides, "border_occluded"),
     )
 
 
@@ -489,7 +600,10 @@ class DocumentConfirmationTracker:
             "working_resolution=%dx%d edge_support_top=%.3f edge_support_right=%.3f "
             "edge_support_bottom=%.3f edge_support_left=%.3f edge_support_mean=%.3f "
             "edge_support_min=%.3f supported_sides=%d interior_surround=%.3f "
-            "band_width_px=%.1f inner_offset_px=%.1f outer_offset_px=%.1f",
+            "band_width_px=%.1f inner_offset_px=%.1f outer_offset_px=%.1f "
+            "observed_sides=%d occluded_sides=%d observable_mean=%.3f "
+            "geometry_confidence=%.3f geometry_edge_support=%.3f "
+            "side_occluded=%s",
             status,
             result.reason,
             int(result.accepted),
@@ -528,6 +642,12 @@ class DocumentConfirmationTracker:
             result.edge_band_width_px,
             result.edge_band_inner_offset_px,
             result.edge_band_outer_offset_px,
+            result.observed_side_count,
+            result.occluded_side_count,
+            result.edge_support_observable_mean,
+            result.geometry_confidence,
+            result.geometry_edge_support,
+            ",".join(str(v) for v in result.side_border_occluded),
         )
         logger.debug(
             "event=document_confirmation_edges reason=%s top=%.3f right=%.3f bottom=%.3f left=%.3f "
