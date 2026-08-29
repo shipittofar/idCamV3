@@ -315,7 +315,8 @@ class AutofocusController:
                     "preview_floor=%.1f still_threshold=%.1f attempt=%d "
                     "lens_before=%s lens_after=%s af_state=%s "
                     "focus_fom_before=%s focus_fom_after=%s "
-                    "preview_roi=%s sensor_roi=%s completion=%s",
+                    "af_min_lens=%.3f af_max_lens=%.3f "
+                    "preview_roi=%s sensor_roi=%s completion=%s roi_source=document_geometry",
                     last_method,
                     hardware_ok,
                     verification_log,
@@ -331,6 +332,8 @@ class AutofocusController:
                     last_af_state,
                     last_fom_before,
                     last_fom_after,
+                    self.config.af_min_lens_position,
+                    self.config.af_max_lens_position,
                     self.debug.preview_roi,
                     self.debug.sensor_roi,
                     last_completion,

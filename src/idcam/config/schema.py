@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 # First-install production template values. These are always rejected so the
 # service cannot look "ready" while still pointing at a placeholder endpoint.
@@ -67,8 +67,18 @@ class CameraConfig(BaseModel):
     af_max_retries: int = Field(3, ge=1, le=10)
     af_timeout_sec: float = Field(10.0, gt=0, le=120)
     af_verify_max_retries: int = Field(2, ge=1, le=5)
+    # Production AF search range (dioptres). Hardware calibration: sharp ~8.9.
+    af_min_lens_position: float = Field(8.7, ge=0.0, le=32.0)
+    af_max_lens_position: float = Field(9.2, ge=0.0, le=32.0)
+    af_lens_search_step: float = Field(0.05, gt=0.0, le=1.0)
     capture_timeout_sec: float = Field(45.0, gt=0, le=300)
     recovery: CameraRecoveryConfig = CameraRecoveryConfig()
+
+    @model_validator(mode="after")
+    def _af_search_range_order(self) -> CameraConfig:
+        if self.af_max_lens_position < self.af_min_lens_position:
+            raise ValueError("af_max_lens_position must be >= af_min_lens_position")
+        return self
 
     @property
     def recovery_max_attempts(self) -> int:

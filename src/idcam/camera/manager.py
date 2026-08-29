@@ -38,6 +38,38 @@ _AF_STATE_FAILED = 3
 _AF_METERING_WINDOWS = 1
 _AF_RANGE_FULL = 2
 
+# Production autofocus search (dioptres). Must match CameraConfig defaults.
+AF_MIN_LENS_POSITION = 8.7
+AF_MAX_LENS_POSITION = 9.2
+AF_LENS_SEARCH_STEP = 0.05
+_AF_LENS_EPS = 1e-6
+
+
+def af_lens_search_positions(lo: float, hi: float, step: float) -> list[float]:
+    """Inclusive lens positions for the production AF search."""
+    start = float(lo)
+    stop = float(hi)
+    if stop < start:
+        start, stop = stop, start
+    increment = max(float(step), 1e-4)
+    positions: list[float] = []
+    pos = start
+    while pos <= stop + _AF_LENS_EPS:
+        positions.append(round(pos, 4))
+        pos += increment
+    if not positions or abs(positions[-1] - stop) > 0.0005:
+        positions.append(round(stop, 4))
+    # Deduplicate while preserving order (rounding can collide at the end).
+    unique: list[float] = []
+    for value in positions:
+        if not unique or abs(unique[-1] - value) > _AF_LENS_EPS:
+            unique.append(value)
+    return unique
+
+
+def lens_in_af_search_range(value: float, lo: float, hi: float) -> bool:
+    return float(lo) - _AF_LENS_EPS <= float(value) <= float(hi) + _AF_LENS_EPS
+
 # Preview-pixel AfWindows source must be large enough to map to a real sensor window.
 MIN_PREVIEW_AF_SIDE = 8
 # Expand the document bbox for hardware AF only (Laplacian still uses the document).
@@ -269,8 +301,19 @@ class CameraManager:
         self._logged_preview_format = False
         self._preview_af_mode: str | None = None
         self._mock_af_mode = 1
-        self._mock_lens = 1.0
+        self._mock_lens = float(config.af_min_lens_position)
         self._mock_fom = 26.0
+        self._af_lens_commands: list[float] = []
+        self._last_bounded_af: AutofocusWaitResult | None = None
+        self._last_document_af_roi: tuple[int, int, int, int] | None = None
+
+    @property
+    def AF_MIN_LENS_POSITION(self) -> float:
+        return float(self.config.af_min_lens_position)
+
+    @property
+    def AF_MAX_LENS_POSITION(self) -> float:
+        return float(self.config.af_max_lens_position)
 
     @property
     def is_mock(self) -> bool:
@@ -618,6 +661,7 @@ class CameraManager:
                 raise CameraError(f"Invalid document AF ROI: {exc}") from exc
             clipped = mapped["preview_roi"]
             sensor = mapped["sensor_roi"]
+            self._last_document_af_roi = document_roi
             if not self._use_mock and self._picam2 is not None:
                 x, y, w, h = sensor
                 self._set_controls_unlocked(
@@ -652,140 +696,136 @@ class CameraManager:
             }
 
     def trigger_autofocus(self) -> None:
-        """Start a one-shot Auto cycle. Does not wait; callers must poll completion."""
+        """Start production AF: a Manual lens search in [af_min, af_max], not AfRange Full."""
+        self._last_bounded_af = None
+        lo, hi = self.AF_MIN_LENS_POSITION, self.AF_MAX_LENS_POSITION
+        logger.info(
+            "event=autofocus_triggered method=bounded_lens_search "
+            "af_min_lens=%.3f af_max_lens=%.3f AfMode=Manual",
+            lo,
+            hi,
+        )
         with self._lock:
             if self._use_mock:
+                self._mock_af_mode = int(self._af_mode_manual())
                 return
-            assert self._picam2 is not None
-            # Do not call picam2.autofocus_cycle() here: a blocking wait holds
-            # the camera lock and can stall metadata/preview updates.
-            self._set_controls_unlocked(
-                {
-                    "AfMode": self._af_mode_auto(),
-                    "AfSpeed": self._af_speed_fast(),
-                    "AfRange": self._af_range_full(),
-                    "AfTrigger": self._af_trigger_start(),
-                }
-            )
-            logger.info(
-                "event=autofocus_triggered method=af_controls AfMode=Auto AfSpeed=Fast "
-                "AfRange=Full AfTrigger=Start"
-            )
+            if self._picam2 is None:
+                return
+            self._set_controls_unlocked({"AfMode": self._af_mode_manual()})
 
-    def wait_for_autofocus_completion(self, timeout_sec: float) -> AutofocusWaitResult:
-        """Wait for AfState Focused/Failed, else LensPosition settle. Never holds the camera lock across sleeps."""
-        if self._use_mock:
-            time.sleep(0.01)
-            return AutofocusWaitResult(
-                af_state=_AF_STATE_FOCUSED,
-                lens_position=1.0,
-                focus_fom=None,
-                method="af_state",
-                timed_out=False,
+    def _command_production_af_lens(self, requested: float) -> float | None:
+        """Send one production-AF LensPosition. Never commands outside [min, max]."""
+        lo, hi = self.AF_MIN_LENS_POSITION, self.AF_MAX_LENS_POSITION
+        value = float(requested)
+        if not lens_in_af_search_range(value, lo, hi):
+            logger.error(
+                "event=autofocus_lens_range_violation requested_lens=%.4f min_lens=%.3f max_lens=%.3f",
+                value,
+                lo,
+                hi,
             )
-        timeout = max(0.5, float(timeout_sec))
-        first = self.capture_metadata()
-        if "AfState" not in first:
-            lens = self.wait_for_lens_settle(timeout)
-            fom = first.get("FocusFoM")
-            try:
-                fom_f = float(fom) if fom is not None else None
-            except (TypeError, ValueError):
-                fom_f = None
-            return AutofocusWaitResult(
-                af_state=None,
-                lens_position=lens,
-                focus_fom=fom_f,
-                method="lens_settle",
-                timed_out=False,
+            return None
+        self._af_lens_commands.append(value)
+        with self._lock:
+            self._set_controls_unlocked(
+                {"AfMode": self._af_mode_manual(), "LensPosition": value}
             )
-        deadline = time.monotonic() + timeout
-        last_state: int | None = None
-        last_lens: float | None = None
+            if self._use_mock:
+                self._mock_lens = value
+                self._mock_fom = 135.0 - abs(value - 8.905) * 400.0
+                self._mock_af_mode = int(self._af_mode_manual())
+        return value
+
+    def _run_bounded_lens_search(self, timeout_sec: float) -> AutofocusWaitResult:
+        lo, hi = self.AF_MIN_LENS_POSITION, self.AF_MAX_LENS_POSITION
+        step = float(self.config.af_lens_search_step)
+        positions = af_lens_search_positions(lo, hi, step)
+        calibrated = 8.905
+        if lens_in_af_search_range(calibrated, lo, hi) and all(abs(p - calibrated) > 0.0004 for p in positions):
+            positions = sorted(positions + [round(calibrated, 4)])
+        self._af_lens_commands = []
+        logger.info(
+            "event=autofocus_search_range af_min_lens=%.3f af_max_lens=%.3f "
+            "step=%.3f samples=%d",
+            lo,
+            hi,
+            step,
+            len(positions),
+        )
+        deadline = time.monotonic() + max(0.2, float(timeout_sec))
+        best_pos = positions[0]
+        best_fom = -1.0
         last_fom: float | None = None
-        samples = 0
-        meta = first
-        try:
-            initial_state = int(first["AfState"])
-        except (TypeError, ValueError, KeyError):
-            initial_state = None
-        started_focused = initial_state == _AF_STATE_FOCUSED
-        saw_scanning = initial_state == _AF_STATE_SCANNING
-        stale_focus_grace = time.monotonic() + 0.6
-        while time.monotonic() < deadline:
-            samples += 1
-            try:
-                last_state = int(meta["AfState"]) if "AfState" in meta else last_state
-            except (TypeError, ValueError):
-                pass
-            raw_lens = meta.get("LensPosition")
-            try:
-                last_lens = float(raw_lens) if raw_lens is not None else last_lens
-            except (TypeError, ValueError):
-                pass
-            raw_fom = meta.get("FocusFoM")
-            try:
-                last_fom = float(raw_fom) if raw_fom is not None else last_fom
-            except (TypeError, ValueError):
-                pass
-            if last_state == _AF_STATE_SCANNING:
-                saw_scanning = True
-            if samples == 1 or samples % 5 == 0:
-                logger.debug(
-                    "event=autofocus_progress sample=%d af_state=%s lens=%s focus_fom=%s",
-                    samples,
-                    last_state,
-                    last_lens,
-                    last_fom,
-                )
-            if last_state == _AF_STATE_FOCUSED:
-                # After AfTrigger, a leftover Focused from preview Continuous AF
-                # is not completion of *this* scan. Wait for Scanning, or a short
-                # grace if the lens is already on target and never leaves Focused.
-                accept_focused = saw_scanning or not started_focused or time.monotonic() >= stale_focus_grace
-                if accept_focused:
-                    logger.info(
-                        "event=autofocus_result method=af_state af_state=%s lens_position=%s focus_fom=%s",
-                        last_state,
-                        last_lens,
-                        last_fom,
-                    )
-                    return AutofocusWaitResult(
-                        af_state=last_state,
-                        lens_position=last_lens,
-                        focus_fom=last_fom,
-                        method="af_state",
-                        timed_out=False,
-                    )
-            if last_state == _AF_STATE_FAILED:
-                logger.info(
-                    "event=autofocus_result method=af_state af_state=%s lens_position=%s focus_fom=%s",
-                    last_state,
-                    last_lens,
-                    last_fom,
-                )
-                return AutofocusWaitResult(
-                    af_state=last_state,
-                    lens_position=last_lens,
-                    focus_fom=last_fom,
-                    method="af_state",
-                    timed_out=False,
-                )
-            time.sleep(0.1)
+        timed_out = False
+        settle = 0.0 if self._use_mock else 0.05
+        for pos in positions:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            sent = self._command_production_af_lens(pos)
+            if sent is None:
+                continue
+            if settle:
+                time.sleep(settle)
             meta = self.capture_metadata()
-        logger.warning(
-            "event=autofocus_timeout method=af_state last_af_state=%s lens_position=%s focus_fom=%s",
-            last_state,
-            last_lens,
-            last_fom,
+            raw = meta.get("FocusFoM")
+            try:
+                fom = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                fom = None
+            last_fom = fom
+            score = fom if fom is not None else -1.0
+            if score >= best_fom:
+                best_fom = score
+                best_pos = sent
+        locked = self._command_production_af_lens(best_pos)
+        final = locked if locked is not None else best_pos
+        if settle:
+            time.sleep(settle)
+        meta = self.capture_metadata()
+        try:
+            final_lens = float(meta["LensPosition"]) if meta.get("LensPosition") is not None else final
+        except (TypeError, ValueError, KeyError):
+            final_lens = final
+        try:
+            final_fom = float(meta["FocusFoM"]) if meta.get("FocusFoM") is not None else (
+                best_fom if best_fom >= 0 else last_fom
+            )
+        except (TypeError, ValueError, KeyError):
+            final_fom = best_fom if best_fom >= 0 else last_fom
+        try:
+            af_state = int(meta["AfState"]) if "AfState" in meta else _AF_STATE_FOCUSED
+        except (TypeError, ValueError):
+            af_state = _AF_STATE_FOCUSED
+        if af_state != _AF_STATE_FAILED:
+            af_state = _AF_STATE_FOCUSED
+        roi = self._last_document_af_roi
+        logger.info(
+            "event=autofocus_result method=bounded_lens_search af_min_lens=%.3f af_max_lens=%.3f "
+            "best_lens=%.4f final_lens=%s af_state=%s focus_fom=%s roi_source=%s roi=%s timed_out=%s",
+            lo,
+            hi,
+            best_pos,
+            final_lens,
+            af_state,
+            final_fom,
+            "document_geometry" if roi else "unknown",
+            "{},{},{},{}".format(*roi) if roi else "",
+            int(timed_out),
         )
         return AutofocusWaitResult(
-            af_state=last_state,
-            lens_position=last_lens,
-            focus_fom=last_fom,
-            method="timeout",
-            timed_out=True,
+            af_state=af_state if not timed_out else (af_state if af_state == _AF_STATE_FAILED else None),
+            lens_position=float(final_lens) if final_lens is not None else float(best_pos),
+            focus_fom=final_fom,
+            method="timeout" if timed_out else "bounded_lens_search",
+            timed_out=timed_out,
         )
+
+    def wait_for_autofocus_completion(self, timeout_sec: float) -> AutofocusWaitResult:
+        """Run (or finish) the bounded Manual lens search. Does not use AfRange Full."""
+        result = self._run_bounded_lens_search(timeout_sec)
+        self._last_bounded_af = result
+        return result
 
     def wait_for_lens_settle(self, timeout_sec: float) -> float | None:
         """Wait until LensPosition stops changing. Used when AfState is unavailable."""

@@ -111,8 +111,8 @@ class SequentialAfCamera(FakeCamera):
         fom = 26.0
         for i, state in enumerate(self.states):
             last = state
-            lens = 1.0 + i * 2.0
-            fom = 26.0 + i * 80.0
+            lens = 8.7 + i * 0.1
+            fom = 80.0 + i * 20.0
             self.metadata = {"AfState": state, "LensPosition": lens, "FocusFoM": fom}
             if state == 2:
                 return AutofocusWaitResult(2, lens, fom, "af_state", False)
@@ -123,13 +123,13 @@ class SequentialAfCamera(FakeCamera):
 
 class LensSettleCamera(FakeCamera):
     def __init__(self) -> None:
-        super().__init__(has_cycle=False, metadata={"LensPosition": 8.0})
+        super().__init__(has_cycle=False, metadata={"LensPosition": 8.9})
 
     def trigger_autofocus(self) -> None:
         self.trigger_calls = getattr(self, "trigger_calls", 0) + 1
 
     def wait_for_autofocus_completion(self, timeout_sec: float) -> AutofocusWaitResult:
-        return AutofocusWaitResult(None, 8.0, None, "lens_settle", False)
+        return AutofocusWaitResult(None, 8.9, None, "lens_settle", False)
 
 
 class TestAutofocusController:
@@ -531,4 +531,77 @@ class TestPaddedAfWindow:
             with pytest.raises(AutofocusError) as raised:
                 await ctl.verify_focus(camera, sharpness_threshold=48.0)
         assert raised.value.reason == "focus_verification_failed"
+
+
+class TestBoundedAfLensSearch:
+    def test_search_positions_include_boundaries(self):
+        from idcam.camera.manager import af_lens_search_positions
+
+        pts = af_lens_search_positions(8.7, 9.2, 0.05)
+        assert pts[0] == pytest.approx(8.7, abs=1e-6)
+        assert pts[-1] == pytest.approx(9.2, abs=1e-6)
+        assert all(8.7 - 1e-6 <= p <= 9.2 + 1e-6 for p in pts)
+
+    def test_manager_search_never_commands_outside_range(self):
+        from idcam.camera.manager import CameraManager
+
+        mgr = CameraManager(CameraConfig(preview_width=320, preview_height=240), use_mock=True)
+        mgr.initialize()
+        mgr.apply_document_focus_window((40, 20, 200, 160), (320, 240))
+        mgr.trigger_autofocus()
+        result = mgr.wait_for_autofocus_completion(1.0)
+        assert result.timed_out is False
+        assert result.af_state == 2
+        assert result.lens_position is not None
+        assert 8.7 <= result.lens_position <= 9.2
+        assert any(abs(c - 8.7) < 1e-6 for c in mgr._af_lens_commands)
+        assert any(abs(c - 9.2) < 1e-6 for c in mgr._af_lens_commands)
+        assert any(abs(c - 8.905) < 1e-6 for c in mgr._af_lens_commands)
+        assert all(8.7 - 1e-6 <= c <= 9.2 + 1e-6 for c in mgr._af_lens_commands)
+        assert result.lens_position == pytest.approx(8.905, abs=0.002)
+        mgr.shutdown()
+
+    def test_out_of_range_command_is_blocked(self, caplog):
+        from idcam.camera.manager import CameraManager
+
+        mgr = CameraManager(CameraConfig(preview_width=320, preview_height=240), use_mock=True)
+        mgr.initialize()
+        before = list(mgr._af_lens_commands)
+        lens_before = mgr.capture_metadata()["LensPosition"]
+        assert mgr._command_production_af_lens(5.0) is None
+        assert mgr._command_production_af_lens(12.0) is None
+        assert mgr._af_lens_commands == before
+        assert mgr.capture_metadata()["LensPosition"] == lens_before
+        assert "autofocus_lens_range_violation" in caplog.text
+        sent = mgr._command_production_af_lens(8.905)
+        assert sent == pytest.approx(8.905)
+        assert mgr.capture_metadata()["LensPosition"] == pytest.approx(8.905)
+        mgr.shutdown()
+
+    def test_af_windows_mapping_unchanged(self):
+        preview_size = (1920, 1080)
+        scaler = (0, 898, 9152, 5148)
+        left = (40, 200, 480, 640)
+        mapped = preview_roi_to_af_window(left, preview_size, scaler)
+        center_search = preview_roi_to_af_window((288, 162, 1344, 756), preview_size, scaler)
+        assert mapped["preview_roi"][0] == 40
+        assert mapped["sensor_roi"] != center_search["sensor_roi"]
+
+    @pytest.mark.asyncio
+    async def test_timeout_and_failed_af_state_unchanged(self):
+        camera = SequentialAfCamera(states=[0, 1, 1])
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=1))
+        ctl.probe_capabilities(camera)
+        with pytest.raises(AutofocusError) as raised:
+            await ctl.run_autofocus(camera, sharpness_threshold=1.0)
+        assert raised.value.reason == "autofocus_timeout"
+
+        camera = SequentialAfCamera(states=[1, 3])
+        ctl = AutofocusController(CameraConfig(af_timeout_sec=1.0, af_max_retries=3))
+        ctl.probe_capabilities(camera)
+        with pytest.raises(AutofocusError) as raised:
+            await ctl.run_autofocus(camera, sharpness_threshold=1.0)
+        assert raised.value.reason == "autofocus_hardware_failed"
+        assert camera.trigger_calls == 3
+
 
