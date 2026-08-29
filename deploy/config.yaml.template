@@ -102,4 +102,5 @@ debug:
   fps: 5.0
   jpeg_quality: 70
   max_width: 1920
+  max_height: 1080
   overlay: true

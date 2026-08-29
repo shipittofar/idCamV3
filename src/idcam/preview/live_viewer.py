@@ -144,15 +144,23 @@ class LiveFrameBuffer:
             self._cond.notify_all()
 
 
-def resize_debug_frame(frame: np.ndarray, max_width: int) -> np.ndarray:
-    """Resize only a debug copy. Never upscale."""
+def resize_debug_frame(
+    frame: np.ndarray,
+    max_width: int,
+    max_height: int = 0,
+) -> np.ndarray:
+    """Contain-fit shrink of a debug copy. Never upscale or crop."""
     if frame.ndim < 2:
         return frame
     height, width = frame.shape[:2]
-    if width <= max_width or max_width <= 0:
+    scale = 1.0
+    if max_width > 0 and width > max_width:
+        scale = min(scale, max_width / float(width))
+    if max_height > 0 and height > max_height:
+        scale = min(scale, max_height / float(height))
+    if scale >= 1.0:
         return frame
-    scale = max_width / float(width)
-    new_size = (max_width, max(1, int(round(height * scale))))
+    new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
     return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
 
 
@@ -304,17 +312,18 @@ def compose_debug_frame(
     max_width: int,
     *,
     overlay: bool = True,
+    max_height: int = 0,
 ) -> np.ndarray:
-    """Draw overlay in ``frame`` preview coordinates, then shrink for MJPEG.
+    """Draw overlay in ``frame`` preview coordinates, then contain-fit for MJPEG.
 
     Document/focus ROIs are preview pixels of ``frame``. Draw first, then resize,
-    so a 1920-space box is not painted onto a narrower JPEG.
+    so a 1920-space box is not painted onto a narrower JPEG. Never crop.
     """
     if overlay:
         image = draw_overlay(frame, snapshot, fps)
     else:
         image = frame.copy()
-    return resize_debug_frame(image, max_width)
+    return resize_debug_frame(image, max_width, max_height)
 
 
 def _parse_roi(value: str) -> tuple[int, int, int, int] | None:
@@ -361,8 +370,8 @@ _HTML_PAGE = """<!DOCTYPE html>
     h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
     .note { color: #aaa; font-size: 0.85rem; margin-top: 4px; }
     main { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px; }
-    img { width: auto; max-width: min(100%, 1920px); height: auto; object-fit: contain;
-           background: #000; border: 1px solid #333; }
+    img { width: auto; max-width: min(100%, 1920px); max-height: min(90vh, 1080px);
+           height: auto; object-fit: contain; background: #000; border: 1px solid #333; }
     dl { margin: 0; }
     dt { color: #888; font-size: 0.75rem; text-transform: uppercase; margin-top: 12px; }
     dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; font-size: 1.05rem; }
@@ -1256,7 +1265,7 @@ class LiveDebugViewer:
             if self.config.overlay:
                 image = draw_overlay(image, snap, self._actual_fps or self.config.fps)
             else:
-                image = resize_debug_frame(image, self.config.max_width)
+                image = resize_debug_frame(image, self.config.max_width, self.config.max_height)
             return encode_jpeg(image, self.config.jpeg_quality)
 
         if not self._logged_encode_format:
@@ -1275,5 +1284,6 @@ class LiveDebugViewer:
             self._actual_fps or self.config.fps,
             self.config.max_width,
             overlay=self.config.overlay,
+            max_height=self.config.max_height,
         )
         return encode_jpeg(image, self.config.jpeg_quality)

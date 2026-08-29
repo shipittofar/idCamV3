@@ -156,10 +156,19 @@ debug:
   fps: 5.0
   jpeg_quality: 70
   max_width: 1920
+  max_height: 1080
   overlay: true
 ```
 
-This exposes a live camera image over HTTP **without authentication**. Do not enable on untrusted networks. Restart the service after changing config:
+The debug JPEG is a **contain-fit** of the full 1920×1080 camera preview (no crop). Overlays are drawn in preview pixels, then the copy is scaled if needed.
+
+**Existing devices:** `install.sh` does not rewrite `/etc/idcam/config.yaml`. If that file still has `debug.max_width: 1280`, the live viewer will keep shrinking to 1280-wide until you set `max_width: 1920` and `max_height: 1080` and restart:
+
+```bash
+sudo systemctl restart idcam
+```
+
+This exposes a live camera image over HTTP **without authentication**. Do not enable on untrusted networks. After changing config:
 
 ```bash
 sudo systemctl restart idcam

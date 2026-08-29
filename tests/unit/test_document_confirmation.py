@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import cv2
 import numpy as np
@@ -11,6 +12,7 @@ import pytest
 from idcam.app.orchestrator import ApplicationOrchestrator
 from idcam.app.state_machine import AppState
 from idcam.app.transaction import ActiveCaptureTransaction
+from idcam.camera.autofocus import AutofocusResult
 from idcam.config.schema import AppConfig, CameraConfig, DetectionConfig, QualityConfig, ServerConfig, UIConfig
 from idcam.system.component_health import ComponentStatus, HealthLevel
 from idcam.vision.document_confirmation import DocumentConfirmation, confirm_document
@@ -489,3 +491,142 @@ class TestAutoCaptureGuards:
         assert orch.sm.state == AppState.DOCUMENT_DETECTED
         assert orch._transaction is not None
         assert orch._transaction.trigger == "manual"
+
+
+    def test_orchestrator_does_not_use_confirm_document_as_a_gate(self):
+        src = Path(__file__).resolve().parents[2] / "src" / "idcam" / "app" / "orchestrator.py"
+        text = src.read_text(encoding="utf-8")
+        assert "confirm_document" not in text
+        assert "temporally_confirmed" not in text
+        assert "_confirmation_holds" not in text
+
+
+@pytest.mark.parametrize(
+    "label,box",
+    [
+        ("center", (80, 60, 480, 360)),
+        ("left", (8, 100, 260, 170)),
+        ("right", (360, 100, 260, 170)),
+        ("top", (160, 8, 300, 160)),
+        ("bottom", (160, 300, 300, 160)),
+        ("top_left", (8, 8, 240, 150)),
+        ("top_right", (392, 8, 240, 150)),
+        ("bottom_left", (8, 322, 240, 150)),
+        ("bottom_right", (392, 322, 240, 150)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_auto_capture_placement_matrix(app_config, label, box):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.IDLE
+    await _assert_auto_if_geometry(orch, _id_card(box=box, printed=True), app_config)
+
+
+@pytest.mark.parametrize("angle", [0, 20, 45, 90])
+@pytest.mark.asyncio
+async def test_auto_capture_rotation_matrix(app_config, angle):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.IDLE
+    await _assert_auto_if_geometry(orch, _id_card(angle=angle, printed=True), app_config)
+
+
+@pytest.mark.parametrize(
+    "label,box",
+    [
+        ("small", (220, 180, 180, 120)),
+        ("medium", (120, 90, 360, 240)),
+        ("large", (8, 8, 620, 460)),
+        ("near_full_frame", (2, 2, 636, 476)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_auto_capture_size_matrix(app_config, label, box):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.IDLE
+    await _assert_auto_if_geometry(orch, _id_card(box=box, printed=True), app_config)
+
+
+@pytest.mark.parametrize("n_borders", [0, 1, 2, 3])
+@pytest.mark.asyncio
+async def test_auto_capture_border_contact_matrix(app_config, n_borders):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.IDLE
+    h, w = 480, 640
+    if n_borders == 0:
+        frame = _id_card((h, w), (80, 80, 400, 260), printed=True)
+    elif n_borders == 1:
+        frame = _id_card((h, w), (0, 80, 400, 260), printed=True)
+    elif n_borders == 2:
+        frame = _id_card((h, w), (0, 0, 420, 280), printed=True)
+    else:
+        frame = _id_card((h, w), (0, 0, w, 300), printed=True)
+    await _assert_auto_if_geometry(orch, frame, app_config)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "insufficient_edge_support",
+        "border_occlusion",
+        "low_paper_contrast",
+        "no_fold",
+        "no_print",
+        "interior_surround",
+    ],
+)
+@pytest.mark.asyncio
+async def test_semantic_confirmation_reasons_do_not_block_auto(app_config, reason):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.IDLE
+    page = _id_card(printed=True)
+    orch._safe_preview = AsyncMock(return_value=page)
+    orch.document_confirmation.last = _rejected(reason)
+    orch.document_confirmation.update = lambda *_a, **_k: orch.document_confirmation.last
+    await _idle_until_auto(orch)
+    assert orch._transaction.trigger == "auto"
+    assert orch.document_confirmation.last.reason == reason
+    assert orch.document_confirmation.last.accepted is False
+
+
+@pytest.mark.asyncio
+async def test_pre_af_ignores_confirm_document_reject(app_config):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.FOCUSING
+    orch._resume_state = AppState.IDLE
+    orch._transaction = ActiveCaptureTransaction(capture_id="cap-1", trigger="auto")
+    page = _id_card(printed=True)
+    orch._snapshot_accepted_geometry(DocumentDetector(app_config.detection).detect_geometry(page))
+    orch._safe_preview = AsyncMock(return_value=page)
+    orch.autofocus.run_autofocus = AsyncMock(
+        return_value=AutofocusResult(True, 90.0, 1, None, "hardware_cycle", 10.0)
+    )
+    rejected = _rejected("insufficient_edge_support")
+    with patch("idcam.vision.document_confirmation.confirm_document", return_value=rejected) as mocked:
+        await orch._focusing_tick()
+    mocked.assert_not_called()
+    orch.autofocus.run_autofocus.assert_awaited()
+    assert orch.sm.state == AppState.FOCUS_VERIFICATION
+
+
+@pytest.mark.asyncio
+async def test_pre_capture_ignores_confirm_document_reject(app_config, tmp_path):
+    orch = _orch(app_config)
+    orch.sm.state = AppState.CAPTURING
+    orch._resume_state = AppState.IDLE
+    orch._transaction = ActiveCaptureTransaction(capture_id="cap-1", trigger="auto")
+    orch._transaction.mark_focus_completed(90.0, 10.0)
+    page = _id_card(printed=True)
+    orch._snapshot_accepted_geometry(DocumentDetector(app_config.detection).detect_geometry(page))
+    orch._safe_preview = AsyncMock(return_value=page)
+    orch._check_motion_abort = AsyncMock(return_value=True)
+
+    async def fake_capture(_camera, path):
+        path.write_bytes(b"\xff\xd8\xff" + b"\x00" * 500)
+        return path
+
+    orch.capture_service.capture = fake_capture
+    rejected = _rejected("border_occlusion")
+    with patch("idcam.vision.document_confirmation.confirm_document", return_value=rejected) as mocked:
+        await orch._capturing_tick()
+    mocked.assert_not_called()
+    assert orch.sm.state == AppState.IMAGE_VALIDATION

@@ -454,10 +454,13 @@ class ApplicationOrchestrator:
         self._last_geometry_status = status
         stab = self.geometry_stability.debug_info()
         logger.info(
-            "event=geometry_gate status=%s present=%s reason=%s confidence=%.3f "
-            "bbox=%s corners=%s stable_count=%d/%d displacement_px=%.2f",
+            "event=geometry_gate status=%s geometry_present=%s geometry_stable=%s "
+            "auto_capture_gate=%s confirmation_result=not_used confirmation_blocking=0 "
+            "reason=%s confidence=%.3f bbox=%s corners=%s stable_count=%d/%d displacement_px=%.2f",
             status,
             int(geom.present),
+            int(stab.stable),
+            int(bool(geom.present and stab.stable)),
             geom.reason,
             geom.confidence,
             geom.bbox,
@@ -534,7 +537,14 @@ class ApplicationOrchestrator:
         if self._auto_document_ready(geom, ready):
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
-                "event=document_detected reason=%s confidence=%.3f bbox=%s document_confirmed=1",
+                "event=auto_capture_gate geometry_present=1 geometry_stable=1 auto_capture_gate=1 "
+                "confirmation_result=not_used confirmation_blocking=0 reason=%s confidence=%.3f bbox=%s",
+                geom.reason,
+                geom.confidence,
+                geom.bbox,
+            )
+            logger.info(
+                "event=document_detected reason=%s confidence=%.3f bbox=%s",
                 geom.reason,
                 geom.confidence,
                 geom.bbox,
@@ -711,6 +721,10 @@ class ApplicationOrchestrator:
         if ready:
             self._log_geometry_status("geometry_stable", geom)
             logger.info(
+                "event=auto_capture_gate geometry_present=1 geometry_stable=1 auto_capture_gate=1 "
+                "confirmation_result=not_used confirmation_blocking=0 stage=waiting_for_stability"
+            )
+            logger.info(
                 "event=document_ready capture_id=%s reason=%s confidence=%.3f bbox=%s "
                 "stable_count=%d displacement_px=%.2f",
                 self._transaction.capture_id if self._transaction else None,
@@ -751,7 +765,8 @@ class ApplicationOrchestrator:
         auto = self._transaction.trigger == "auto"
         if auto and not self._preview_candidate_usable(frame):
             logger.warning(
-                "event=document_absent reason=pre_af_recheck capture_id=%s",
+                "event=document_absent reason=pre_af_recheck capture_id=%s "
+                "geometry_present=0 confirmation_blocking=0",
                 self._transaction.capture_id,
             )
             await self._fail_transaction_and_wait("document_absent", "Document candidate gone before autofocus")
@@ -900,7 +915,8 @@ class ApplicationOrchestrator:
             preview = await self._safe_preview()
             if preview is None or not self._preview_candidate_usable(preview):
                 logger.warning(
-                    "event=document_absent reason=pre_capture_recheck capture_id=%s",
+                    "event=document_absent reason=pre_capture_recheck capture_id=%s "
+                    "geometry_present=0 confirmation_blocking=0",
                     self._transaction.capture_id,
                 )
                 await self._fail_transaction_and_wait("document_absent", "Document candidate gone before capture")

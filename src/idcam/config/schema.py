@@ -196,6 +196,7 @@ class DebugConfig(BaseModel):
     fps: float = Field(5.0, gt=0, le=15)
     jpeg_quality: int = Field(70, ge=30, le=100)
     max_width: int = Field(1920, ge=320, le=3840)
+    max_height: int = Field(1080, ge=240, le=2160)
     overlay: bool = True
 
     @field_validator("host")
